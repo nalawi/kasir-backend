@@ -1,0 +1,212 @@
+import express from 'express';
+import bcrypt from 'bcryptjs';
+import { db } from '../db.js';
+import { authRequired, requirePermission, audit, assertBranchAccess, scopedBranchIds } from '../auth.js';
+import { wrap, badRequest, notFound, money, txFilter, applyStockDelta } from '../lib/helpers.js';
+import { priceCart, persistTransaction, getTransaction } from '../lib/transactions.js';
+
+const router = express.Router();
+
+/** POST /transactions — live checkout from the POS screen. */
+router.post('/transactions', authRequired, wrap((req, res) => {
+  const { branch_id } = req.body;
+  if (!branch_id) return badRequest(res, 'branch_id required');
+  if (!assertBranchAccess(req, res, branch_id)) return;
+
+  const priced = priceCart({
+    companyId: req.user.company_id,
+    branchId: branch_id,
+    items: req.body.items,
+    discount: req.body.discount,
+    taxPercent: req.body.tax_percent,
+    paymentMethod: req.body.payment_method || 'cash',
+    cashReceived: req.body.cash_received,
+    payments: req.body.payments
+  });
+  if (priced.error) return badRequest(res, priced.error);
+
+  // Checkout (unlike /quote) must be fully paid: either split payments or cash tendered.
+  const hasPayments = Array.isArray(req.body.payments) && req.body.payments.length > 0;
+  const method = req.body.payment_method || 'cash';
+  if (!hasPayments && (method === 'cash') && (req.body.cash_received === undefined || req.body.cash_received === null)) {
+    return badRequest(res, 'cash_received atau payments wajib diisi untuk pembayaran tunai');
+  }
+
+  const { id: txId, duplicate } = persistTransaction({
+    companyId: req.user.company_id,
+    branchId: branch_id,
+    userId: req.user.sub,
+    deviceId: req.body.device_id,
+    client: {
+      totals: priced.totals,
+      prepared: priced.prepared,
+      payment_method: req.body.payment_method || 'cash',
+      note: req.body.note,
+      client_uuid: req.body.client_uuid || null,
+      order_label: req.body.order_label,
+      table_number: req.body.table_number,
+      customer_name: req.body.customer_name,
+      reference_id: req.body.reference_id,
+      code: req.body.code
+    }
+  });
+
+  audit({ company_id: req.user.company_id, branch_id, user_id: req.user.sub, action: 'transaction.create', entity: 'transaction', entity_id: txId, detail: { total: priced.totals.total, duplicate }, ip: req.ip });
+  res.status(duplicate ? 200 : 201).json({ ...getTransaction(txId, req.user.company_id), duplicate });
+}));
+
+/** POST /transactions/quote — price a cart without persisting (cart preview / validation). */
+router.post('/transactions/quote', authRequired, wrap((req, res) => {
+  const { branch_id } = req.body;
+  if (!branch_id) return badRequest(res, 'branch_id required');
+  if (!assertBranchAccess(req, res, branch_id)) return;
+  const priced = priceCart({
+    companyId: req.user.company_id,
+    branchId: branch_id,
+    items: req.body.items,
+    discount: req.body.discount,
+    taxPercent: req.body.tax_percent,
+    paymentMethod: req.body.payment_method || 'cash',
+    // Only forward when supplied — a quote may omit payment info entirely.
+    cashReceived: req.body.cash_received ?? undefined,
+    payments: Array.isArray(req.body.payments) && req.body.payments.length ? req.body.payments : undefined
+  });
+  if (priced.error) return badRequest(res, priced.error);
+  res.json({
+    totals: priced.totals,
+    lines: priced.prepared.map((p) => ({
+      product_id: p.prod.id, product_name: p.prod.name, variant_label: p.variantLabel,
+      quantity: p.qty, price: p.unitPrice, discount: p.itemDiscount, subtotal: p.lineSubtotal
+    }))
+  });
+}));
+
+/** GET /transactions — paginated history with filters. */
+router.get('/transactions', authRequired, wrap((req, res) => {
+  const { from, to, cashier_id, status, payment_method, q, limit = 50, offset = 0 } = req.query;
+  const scope = scopedBranchIds(req);
+  const branchIds = req.query.branch_id ? [req.query.branch_id] : scope;
+  if (req.query.branch_id && !scope.includes(req.query.branch_id)) {
+    return res.status(403).json({ error: 'Forbidden: branch not in your scope' });
+  }
+  const { where, params } = txFilter({
+    companyId: req.user.company_id,
+    branchIds,
+    from,
+    to,
+    cashierId: cashier_id,
+    statuses: status ? status.split(',') : ['completed', 'voided', 'void_pending', 'refunded']
+  });
+  const extra = [];
+  const extraParams = [];
+  if (payment_method) { extra.push('t.payment_method = ?'); extraParams.push(payment_method); }
+  if (q) { extra.push('(t.code LIKE ? OR t.customer_name LIKE ? OR t.receipt_number LIKE ?)'); extraParams.push(`%${q}%`, `%${q}%`, `%${q}%`); }
+  const fullWhere = [where, ...extra].join(' AND ');
+
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM transactions t WHERE ${fullWhere}`).get(...params, ...extraParams).n;
+  const rows = db
+    .prepare(
+      `SELECT t.*, b.name AS branch_name, u.name AS cashier_name,
+              (SELECT COUNT(*) FROM transaction_items i WHERE i.transaction_id = t.id) AS item_count
+       FROM transactions t
+       LEFT JOIN branches b ON b.id = t.branch_id
+       LEFT JOIN users u ON u.id = t.user_id
+       WHERE ${fullWhere} ORDER BY t.created_at DESC LIMIT ? OFFSET ?`
+    )
+    .all(...params, ...extraParams, Number(limit), Number(offset));
+  res.json({ total, limit: Number(limit), offset: Number(offset), rows });
+}));
+
+router.get('/transactions/:id', authRequired, wrap((req, res) => {
+  const t = getTransaction(req.params.id, req.user.company_id);
+  if (!t) return notFound(res, 'Transaction not found');
+  if (!assertBranchAccess(req, res, t.branch_id)) return;
+  res.json(t);
+}));
+
+/** POST /transactions/:id/void — request a void. Cashiers need manager approval. */
+router.post('/transactions/:id/void', authRequired, wrap((req, res) => {
+  const t = getTransaction(req.params.id, req.user.company_id);
+  if (!t) return notFound(res, 'Transaction not found');
+  if (!assertBranchAccess(req, res, t.branch_id)) return;
+  if (t.status !== 'completed') return badRequest(res, `Transaksi sudah ${t.status}`);
+  const { reason, pin } = req.body;
+  if (!reason) return badRequest(res, 'Alasan void wajib diisi');
+
+  const canVoidDirect = req.permissions.includes('transaction.void');
+  let approvedBy = null;
+  if (!canVoidDirect) {
+    // Manager override using their PIN at the till.
+    const manager = pin
+      ? db
+          .prepare(
+            `SELECT u.* FROM users u WHERE u.company_id = ? AND u.is_active = 1
+             AND u.pin_hash IS NOT NULL AND u.role IN ('manager','super_admin')`
+          )
+          .all(req.user.company_id)
+          .find((u) => bcrypt.compareSync(String(pin), u.pin_hash))
+      : null;
+    if (!manager) return res.status(403).json({ error: 'Butuh PIN manager untuk void transaksi' });
+    approvedBy = manager.id;
+  }
+
+  const run = db.transaction(() => {
+    // Restore stock for every line.
+    const items = db.prepare('SELECT * FROM transaction_items WHERE transaction_id = ?').all(t.id);
+    for (const it of items) {
+      if (!it.product_id) continue;
+      applyStockDelta({
+        branchId: t.branch_id, productId: it.product_id, delta: it.quantity, type: 'void',
+        referenceId: t.id, note: `Void ${t.code}: ${reason}`, userId: req.user.sub
+      });
+    }
+    db.prepare(
+      "UPDATE transactions SET status = 'voided', void_reason = ?, approved_by = ? WHERE id = ?"
+    ).run(reason, approvedBy, t.id);
+  });
+  run();
+  audit({ company_id: req.user.company_id, branch_id: t.branch_id, user_id: req.user.sub, action: 'transaction.void', entity: 'transaction', entity_id: t.id, detail: { reason, approved_by: approvedBy, total: t.total }, ip: req.ip });
+  res.json(getTransaction(t.id, req.user.company_id));
+}));
+
+/** GET /transactions/:id/receipt — structured receipt for 58/80mm thermal printing. */
+router.get('/transactions/:id/receipt', authRequired, wrap((req, res) => {
+  const t = getTransaction(req.params.id, req.user.company_id);
+  if (!t) return notFound(res, 'Transaction not found');
+  if (!assertBranchAccess(req, res, t.branch_id)) return;
+  const branch = db.prepare('SELECT * FROM branches WHERE id = ?').get(t.branch_id) || {};
+  const company = db.prepare('SELECT * FROM companies WHERE id = ?').get(req.user.company_id) || {};
+  res.json({
+    company: { name: company.name, address: company.address, phone: company.phone, logo_url: company.logo_url, currency: company.currency },
+    branch: { name: branch.name, address: branch.address, phone: branch.phone },
+    header: {
+      code: t.code,
+      receipt_number: t.receipt_number || t.code,
+      cashier: t.cashier_name,
+      created_at: t.created_at,
+      order_label: t.order_label,
+      table_number: t.table_number,
+      customer_name: t.customer_name
+    },
+    items: t.items.map((i) => ({
+      name: i.product_name,
+      variant: i.variant_label,
+      quantity: i.quantity,
+      price: i.price,
+      discount: i.discount,
+      subtotal: i.subtotal,
+      note: i.note
+    })),
+    totals: {
+      subtotal: t.subtotal, discount: t.discount, tax: t.tax, tax_percent: t.tax_percent,
+      total: t.total, cash_received: t.cash_received, change_due: t.change_due
+    },
+    payment_method: t.payment_method,
+    payments: t.payments || null,
+    status: t.status,
+    note: t.note,
+    footer: 'Terima kasih atas kunjungan Anda'
+  });
+}));
+
+export default router;

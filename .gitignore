@@ -1,0 +1,8 @@
+# Uploaded product photos — runtime data, not source.
+data/uploads/
+
+# SQLite journals
+data/*.db-shm
+data/*.db-wal
+
+node_modules/
