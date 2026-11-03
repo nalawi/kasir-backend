@@ -1,5 +1,6 @@
 import { db } from '../db.js';
 import { id, money, branchPrice, applyStockDelta, nowSql, toSqlTimestamp } from './helpers.js';
+import { enqueueFromTransaction, isPreparedItem } from './kitchen.js';
 
 /**
  * Validate a cart and compute totals against the *current* branch prices.
@@ -113,11 +114,12 @@ export function persistTransaction({ companyId, branchId, userId, deviceId, clie
 
     for (const pi of client.prepared) {
       db.prepare(
-        `INSERT INTO transaction_items (id, transaction_id, product_id, product_name, variant_id, variant_label, price, cost_price, quantity, discount, subtotal, note)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO transaction_items (id, transaction_id, product_id, product_name, variant_id, variant_label, price, cost_price, quantity, discount, subtotal, note, is_prepared)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         id(), txId, pi.prod.id, pi.prod.name, pi.variant ? pi.variant.id : null, pi.variantLabel,
-        pi.unitPrice, pi.prod.cost_price, pi.qty, pi.itemDiscount, pi.lineSubtotal, pi.note
+        pi.unitPrice, pi.prod.cost_price, pi.qty, pi.itemDiscount, pi.lineSubtotal, pi.note,
+        isPreparedItem(pi.prod) ? 1 : 0
       );
       applyStockDelta({
         branchId, productId: pi.prod.id, delta: -pi.qty,
@@ -128,13 +130,34 @@ export function persistTransaction({ companyId, branchId, userId, deviceId, clie
   });
   run();
 
+  // Send the drinks/food to the kitchen display. Best-effort: a queue failure
+  // must never roll back a paid sale, so it is outside the transaction above.
+  let queueId = null;
+  try {
+    queueId = enqueueFromTransaction({
+      companyId,
+      branchId,
+      userId,
+      transactionId: txId,
+      transaction: {
+        order_label: client.order_label,
+        table_number: client.table_number,
+        customer_name: client.customer_name,
+        note: client.note
+      },
+      prepared: client.prepared
+    });
+  } catch {
+    queueId = null;
+  }
+
   // Cash drawer reconciliation counters on the shift.
   if (shift) {
     const cash = t.payment_detail ? t.cash_received : client.payment_method === 'cash' ? t.total : 0;
     db.prepare('UPDATE shifts SET cash_sales = COALESCE(cash_sales,0) + ?, non_cash_sales = COALESCE(non_cash_sales,0) + ? WHERE id = ?')
       .run(cash, money(t.total - cash), shift.id);
   }
-  return { id: txId, duplicate: false };
+  return { id: txId, duplicate: false, queueId };
 }
 
 /** Fetch a transaction with items, branch & cashier names. */

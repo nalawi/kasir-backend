@@ -12,6 +12,7 @@ import stockRoutes from './routes/stock.routes.js';
 import transferRoutes from './routes/transfer.routes.js';
 import posRoutes from './routes/pos.routes.js';
 import holdRoutes from './routes/hold.routes.js';
+import kitchenRoutes from './routes/kitchen.routes.js';
 import shiftRoutes from './routes/shift.routes.js';
 import deviceRoutes from './routes/device.routes.js';
 import reportRoutes from './routes/report.routes.js';
@@ -59,6 +60,7 @@ app.use('/api', stockRoutes);          // /branches/:id/stock, /stock/*, /moveme
 app.use('/api', transferRoutes);       // /transfers/*
 app.use('/api', posRoutes);            // /transactions/*
 app.use('/api', holdRoutes);           // /holds/*
+app.use('/api', kitchenRoutes);        // /branches/:id/queue, /queue/*
 app.use('/api', shiftRoutes);          // /shifts/*
 app.use('/api', deviceRoutes);         // /devices/*
 app.use('/api', reportRoutes);         // /reports/*

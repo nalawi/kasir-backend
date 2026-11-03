@@ -7,6 +7,17 @@ export const id = () => crypto.randomBytes(16).toString('hex');
 /** SQLite-comparable UTC timestamp (`YYYY-MM-DD HH:MM:SS`) matching `datetime('now')`. */
 export const nowSql = () => new Date().toISOString().slice(0, 19).replace('T', ' ');
 
+/**
+ * Express a SQLite timestamp (`YYYY-MM-DD HH:MM:SS`, always UTC) as ISO 8601 with
+ * a `Z`. Without this the browser parses it as *local* time and every elapsed
+ * counter (ticket age, prep time) is off by the user's UTC offset.
+ */
+export function toIso(value) {
+  if (!value) return null;
+  if (/[TZ]/.test(value)) return value;
+  return value.replace(' ', 'T') + 'Z';
+}
+
 /** Full ISO timestamp (with ms + Z) — only for values that are not compared in SQL. */
 export const nowIso = () => new Date().toISOString();
 

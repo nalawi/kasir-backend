@@ -2,6 +2,7 @@ import express from 'express';
 import { db } from '../db.js';
 import { authRequired, requirePermission, scopedBranchIds } from '../auth.js';
 import { wrap, money, txFilter, withStatuses, toCsv, sendCsv } from '../lib/helpers.js';
+import { buildDailyBrief, renderBriefText } from '../lib/dailyBrief.js';
 
 const router = express.Router();
 
@@ -254,6 +255,48 @@ router.get('/reports/profit', authRequired, requirePermission('report.view_profi
 }));
 
 /** GET /reports/export/transactions.csv — transaction ledger export. */
+/**
+ * GET /reports/daily-brief — one-day recap tailored for sharing with the owner.
+ * Query: date (YYYY-MM-DD, default today), branch_id, lang (id|en).
+ *
+ * Returns the structured brief plus the ready-to-send WhatsApp text, so the UI
+ * can show a live preview and the share button from a single request.
+ */
+router.get('/reports/daily-brief', authRequired, requirePermission('report.view_all', 'report.view_branch', 'report.export'), wrap((req, res) => {
+  const branchIds = scopeFor(req, res, req.query.branch_id);
+  if (!branchIds) return;
+  const lang = req.query.lang === 'en' ? 'en' : 'id';
+
+  const company = db.prepare('SELECT name, timezone FROM companies WHERE id = ?').get(req.user.company_id);
+  const brief = buildDailyBrief({
+    companyId: req.user.company_id,
+    branchIds,
+    date: req.query.date,
+    timeZone: company?.timezone || null
+  });
+  const text = renderBriefText(brief, { lang, companyName: company?.name || null });
+
+  res.json({ ...brief, company_name: company?.name || null, lang, text });
+}));
+
+/** GET /reports/daily-brief/text — same brief as plain text, for cron jobs / bots. */
+router.get('/reports/daily-brief/text', authRequired, requirePermission('report.view_all', 'report.view_branch', 'report.export'), wrap((req, res) => {
+  const branchIds = scopeFor(req, res, req.query.branch_id);
+  if (!branchIds) return;
+  const lang = req.query.lang === 'en' ? 'en' : 'id';
+
+  const company = db.prepare('SELECT name, timezone FROM companies WHERE id = ?').get(req.user.company_id);
+  const brief = buildDailyBrief({
+    companyId: req.user.company_id,
+    branchIds,
+    date: req.query.date,
+    timeZone: company?.timezone || null
+  });
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.send(renderBriefText(brief, { lang, companyName: company?.name || null }));
+}));
+
+
 router.get('/reports/export/transactions.csv', authRequired, requirePermission('report.export', 'report.view_all', 'report.view_branch'), wrap((req, res) => {
   const branchIds = scopeFor(req, res, req.query.branch_id);
   if (!branchIds) return;

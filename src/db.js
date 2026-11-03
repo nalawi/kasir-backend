@@ -250,6 +250,45 @@ export function initSchema() {
     note TEXT
   );
 
+  -- Kitchen / barista display queue.
+  -- One row per *prepared* ticket (drinks & food sold at the till), separate from
+  -- hold_orders (unpaid parked carts) and from transactions (money). A ticket may
+  -- be paid (transaction_id) or raised directly by a waiter (null), because
+  -- dine-in orders are often sent to the bar before the bill is settled.
+  CREATE TABLE IF NOT EXISTS order_queue (
+    id TEXT PRIMARY KEY,
+    company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    branch_id TEXT NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+    transaction_id TEXT REFERENCES transactions(id) ON DELETE SET NULL,
+    ticket_no INTEGER,
+    order_label TEXT,
+    table_number TEXT,
+    customer_name TEXT,
+    station TEXT DEFAULT 'both',             -- kitchen | bar | both
+    status TEXT NOT NULL DEFAULT 'queue',    -- queue | preparing | ready | completed | cancelled
+    note TEXT,
+    created_by TEXT,
+    started_by TEXT,
+    ready_by TEXT,
+    closed_by TEXT,
+    cancel_reason TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    started_at TEXT,
+    ready_at TEXT,
+    completed_at TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS order_queue_items (
+    id TEXT PRIMARY KEY,
+    queue_id TEXT NOT NULL REFERENCES order_queue(id) ON DELETE CASCADE,
+    product_id TEXT,
+    product_name TEXT NOT NULL,
+    variant_label TEXT,
+    quantity REAL NOT NULL DEFAULT 1,
+    note TEXT,
+    done INTEGER DEFAULT 0
+  );
+
   -- Offline-first batch sync log (idempotency + conflict resolution audit)
   CREATE TABLE IF NOT EXISTS sync_queue (
     id TEXT PRIMARY KEY,
@@ -287,6 +326,9 @@ export function initSchema() {
   CREATE INDEX IF NOT EXISTS idx_transfers_from ON stock_transfers(from_branch_id);
   CREATE INDEX IF NOT EXISTS idx_transfers_to ON stock_transfers(to_branch_id);
   CREATE INDEX IF NOT EXISTS idx_hold_branch ON hold_orders(branch_id);
+  CREATE INDEX IF NOT EXISTS idx_queue_branch ON order_queue(branch_id, status, created_at);
+  CREATE INDEX IF NOT EXISTS idx_queue_tx ON order_queue(transaction_id);
+  CREATE INDEX IF NOT EXISTS idx_queue_items ON order_queue_items(queue_id);
   CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id);
   CREATE INDEX IF NOT EXISTS idx_attempts_identifier ON login_attempts(identifier, created_at);
   CREATE INDEX IF NOT EXISTS idx_audit_company ON audit_logs(company_id, created_at);
@@ -328,7 +370,8 @@ const MIGRATIONS = {
   transaction_items: [
     ['variant_id', 'TEXT'],
     ['variant_label', 'TEXT'],
-    ['parent_item_id', 'TEXT']
+    ['parent_item_id', 'TEXT'],
+    ['is_prepared', 'INTEGER DEFAULT 0']
   ],
   shifts: [['note', 'TEXT'], ['cash_sales', 'REAL DEFAULT 0'], ['non_cash_sales', 'REAL DEFAULT 0']],
   devices: [['app_version', 'TEXT'], ['platform', 'TEXT'], ['device_key', 'TEXT'], ['revoked_reason', 'TEXT']],

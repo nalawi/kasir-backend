@@ -40,6 +40,13 @@ export const PERMISSION_GROUPS = [
     ]
   },
   {
+    group: 'Antrian Dapur & Bar',
+    items: [
+      { key: 'kitchen.view', label: 'Lihat antrian pesanan (dapur / barista / waiter)' },
+      { key: 'kitchen.manage', label: 'Proses antrian: masak, siap saji, selesai, batalkan' }
+    ]
+  },
+  {
     group: 'Shift & Kas',
     items: [
       { key: 'shift.manage', label: 'Buka / tutup shift semua kasir' },
@@ -68,20 +75,24 @@ export const ROLE_PERMISSIONS = {
     'product.manage', 'product.view_cost', 'stock.manage', 'stock.transfer', 'stock.view',
     'transaction.create', 'transaction.void', 'transaction.void_approve', 'transaction.discount',
     'transaction.view_all', 'hold.manage', 'shift.manage', 'shift.handover', 'shift.reconcile',
+    'kitchen.view', 'kitchen.manage',
     'report.view_branch', 'report.view_profit', 'report.export',
     'user.manage_branch', 'audit.view', 'device.manage'
   ],
   cashier: [
     'transaction.create', 'transaction.discount', 'hold.manage',
+    'kitchen.view', 'kitchen.manage',
     'shift.manage_own', 'shift.handover', 'stock.view'
   ],
-  warehouse: ['stock.manage', 'stock.transfer', 'stock.view', 'product.manage']
+  warehouse: ['stock.manage', 'stock.transfer', 'stock.view', 'product.manage'],
+  kitchen: ['kitchen.view', 'kitchen.manage', 'stock.view']
 };
 
 export const BUILTIN_ROLE_LABELS = {
   super_admin: 'Super Admin (Pemilik)',
   manager: 'Manager Cabang',
   cashier: 'Kasir / Staff',
+  kitchen: 'Barista / Dapur',
   warehouse: 'Staff Gudang'
 };
 
