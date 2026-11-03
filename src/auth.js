@@ -2,8 +2,12 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { db } from './db.js';
 import { ROLE_PERMISSIONS } from './permissions.js';
+import { isEdge, localSecret } from './edge.js';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
+// In edge mode the signing key is the machine's own persisted secret, so tokens
+// minted by the offline unlock (and any token this service re-signs) verify here
+// with no shared configuration. The cloud deployment keeps JWT_SECRET.
+const JWT_SECRET = isEdge() ? localSecret() : process.env.JWT_SECRET || 'dev-secret-change-me';
 const JWT_EXPIRES = process.env.JWT_EXPIRES || '60m';
 const REFRESH_TTL_DAYS = Number(process.env.REFRESH_TTL_DAYS || 30);
 

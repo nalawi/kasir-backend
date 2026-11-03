@@ -1,6 +1,9 @@
 # Uploaded product photos — runtime data, not source.
 data/uploads/
 
+# Edge-mode secret: a per-machine signing key, never committed.
+data/edge-secret.key
+
 # SQLite journals
 data/*.db-shm
 data/*.db-wal

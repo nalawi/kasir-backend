@@ -4,6 +4,8 @@ import { db } from '../db.js';
 import { authRequired, requirePermission, audit, assertBranchAccess, scopedBranchIds } from '../auth.js';
 import { wrap, badRequest, notFound, money, txFilter, applyStockDelta } from '../lib/helpers.js';
 import { priceCart, persistTransaction, getTransaction } from '../lib/transactions.js';
+import { isEdge } from '../edge.js';
+import { enqueueOutbox } from '../lib/edgeOutbox.js';
 
 const router = express.Router();
 
@@ -50,6 +52,31 @@ router.post('/transactions', authRequired, wrap((req, res) => {
       code: req.body.code
     }
   });
+
+  // Edge mode: the sale is real locally, but the cloud has not seen it yet. Copy
+  // the replay payload into the outbox. This is the same shape POST /sync/batch
+  // accepts, so the cloud applies it through the existing, idempotent path.
+  // Skipped on duplicates (an order replayed twice must not be queued twice) and
+  // on the cloud build, where the sale is already authoritative.
+  if (isEdge() && !duplicate && req.body.client_uuid) {
+    enqueueOutbox({
+      clientUuid: req.body.client_uuid,
+      branchId: branch_id,
+      payload: {
+        created_at: req.body.created_at || new Date().toISOString(),
+        items: req.body.items,
+        discount: req.body.discount,
+        tax_percent: req.body.tax_percent,
+        payment_method: req.body.payment_method || 'cash',
+        cash_received: req.body.cash_received,
+        payments: req.body.payments,
+        note: req.body.note,
+        order_label: req.body.order_label,
+        table_number: req.body.table_number,
+        customer_name: req.body.customer_name,
+      },
+    });
+  }
 
   audit({ company_id: req.user.company_id, branch_id, user_id: req.user.sub, action: 'transaction.create', entity: 'transaction', entity_id: txId, detail: { total: priced.totals.total, duplicate }, ip: req.ip });
   res.status(duplicate ? 200 : 201).json({ ...getTransaction(txId, req.user.company_id), duplicate });

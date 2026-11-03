@@ -4,8 +4,12 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const dataDir = path.join(__dirname, '..', 'data');
+// DB_DIR lets the edge (embedded) service point at the app's local data folder,
+// which keeps the SQLite file off cloud-synced paths such as OneDrive that would
+// corrupt the WAL journal. The cloud build keeps the default.
+const dataDir = path.resolve(process.env.DB_DIR || path.join(__dirname, '..', 'data'));
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+export const DATA_DIR = dataDir;
 
 const dbPath = process.env.DB_PATH || path.join(dataDir, 'pos.db');
 export const db = new Database(dbPath);
@@ -308,6 +312,33 @@ export function initSchema() {
     value TEXT
   );
 
+  -- Edge (embedded) mode only. A sale rung up against the local service is
+  -- written straight into the transactions table so the receipt and shift totals
+  -- are real, and its payload is mirrored here so the drain worker can replay it
+  -- to the cloud. The client_uuid is the shared idempotency key, so a replay that
+  -- lands twice is still applied once.
+  CREATE TABLE IF NOT EXISTS edge_outbox (
+    client_uuid TEXT PRIMARY KEY,
+    branch_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending', -- pending | applying | applied | conflict | rejected
+    attempts INTEGER DEFAULT 0,
+    last_error TEXT,
+    next_attempt_at TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+  );
+
+  -- Edge mode only: rate limiting for the offline PIN unlock. Mirrors the cloud's
+  -- login_attempts so a till cannot be brute-forced faster just because it is
+  -- dialled back to the local service.
+  CREATE TABLE IF NOT EXISTS edge_login_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    success INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS login_attempts (
     id TEXT PRIMARY KEY,
     identifier TEXT NOT NULL,
@@ -396,4 +427,6 @@ function migrate() {
     }
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_tx_client_uuid ON transactions(client_uuid);');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_outbox_status ON edge_outbox(branch_id, status);');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_edge_attempts ON edge_login_attempts(user_id, created_at);');
 }

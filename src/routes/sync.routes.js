@@ -35,15 +35,29 @@ router.post('/sync/batch', authRequired, wrap((req, res) => {
       continue;
     }
     const seen = db.prepare('SELECT * FROM sync_queue WHERE client_uuid = ?').get(uuid);
-    if (seen) {
+    // `applied` is terminal: that sale already exists, so replaying it returns the
+    // original result and never double-charges. A `conflict`/`rejected` is only a
+    // past verdict — re-evaluate it, because the cause (usually stock) may have
+    // been fixed since. Replaying the memo forever would strand the sale.
+    if (seen && seen.status === 'applied') {
       let detail = null;
       try {
         detail = seen.detail ? JSON.parse(seen.detail) : null;
       } catch {
         detail = null;
       }
-      results.push({ client_uuid: uuid, status: seen.status, transaction_id: detail && detail.transaction_id, duplicate: true });
+      results.push({
+        client_uuid: uuid,
+        status: 'applied',
+        transaction_id: detail && detail.transaction_id,
+        code: detail && detail.code,
+        duplicate: true
+      });
       continue;
+    }
+    if (seen) {
+      // Clear the stale refusal so the attempt below can record a fresh verdict.
+      db.prepare('DELETE FROM sync_queue WHERE id = ?').run(seen.id);
     }
 
     const priced = priceCart({
@@ -190,6 +204,34 @@ router.get('/sync/bootstrap', authRequired, wrap((req, res) => {
     products: products.map((p) => ({ ...p, variants: variants.filter((v) => v.product_id === p.id) })),
     settings: Object.fromEntries(db.prepare('SELECT key, value FROM settings').all().map((s) => [s.key, s.value]))
   });
+}));
+
+/**
+ * GET /sync/pin-users?branch_id=
+ *
+ * PIN hashes for a branch, so a desktop till can verify PINs locally when the
+ * internet drops. This is the only place a `pin_hash` leaves the cloud.
+ *
+ * Guarded tighter than the public /auth/pin-users list: it needs a real session
+ * (authRequired) and a branch the caller may access. The client is a loopback-
+ * bound edge service that stores the result beside its own SQLite database, so
+ * the blast radius of the hash being present on the device is the device itself.
+ */
+router.get('/sync/pin-users', authRequired, wrap((req, res) => {
+  const { branch_id } = req.query;
+  if (!branch_id) return badRequest(res, 'branch_id required');
+  if (!assertBranchAccess(req, res, branch_id)) return;
+
+  const rows = db
+    .prepare(
+      `SELECT id, company_id, branch_id, name, email, role, avatar_url, pin_hash
+       FROM users
+       WHERE branch_id = ? AND is_active = 1 AND pin_hash IS NOT NULL
+       ORDER BY name`
+    )
+    .all(branch_id);
+
+  res.json(rows);
 }));
 
 export default router;
