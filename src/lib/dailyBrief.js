@@ -319,7 +319,7 @@ export function renderBriefText(brief, { lang = 'id', companyName = null, branch
   }
 
   L.push('');
-  L.push(`_${en ? 'Sent from POS Multi-Cabang' : 'Dikirim dari POS Multi-Cabang'}_`);
+  L.push(`_${en ? 'Sent from Reekas POS' : 'Dikirim dari Reekas POS'}_`);
   return L.join('\n');
 }
 

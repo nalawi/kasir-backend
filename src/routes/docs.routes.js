@@ -145,7 +145,7 @@ router.get('/openapi.json', (req, res) => {
   res.json({
     openapi: '3.0.3',
     info: {
-      title: 'POS Multi-Cabang API',
+      title: 'Reekas POS API',
       version: '1.0.0',
       description:
         'REST API aplikasi POS multi-cabang: autentikasi PIN, katalog produk & varian, stok per cabang, transfer stok, checkout, hold order, shift kas, laporan, sinkronisasi offline, dan audit log.'
