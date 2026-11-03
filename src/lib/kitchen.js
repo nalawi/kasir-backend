@@ -137,6 +137,7 @@ export function createTicket({
   branchId,
   userId = null,
   transactionId = null,
+  holdOrderId = null,
   orderLabel = null,
   tableNumber = null,
   customerName = null,
@@ -163,11 +164,11 @@ export function createTicket({
   const queueId = id();
   const run = db.transaction(() => {
     db.prepare(
-      `INSERT INTO order_queue (id, company_id, branch_id, transaction_id, ticket_no, order_label, table_number,
+      `INSERT INTO order_queue (id, company_id, branch_id, transaction_id, hold_order_id, ticket_no, order_label, table_number,
          customer_name, station, status, note, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queue', ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queue', ?, ?)`
     ).run(
-      queueId, companyId, branchId, transactionId, nextTicketNo(branchId), orderLabel, tableNumber,
+      queueId, companyId, branchId, transactionId, holdOrderId, nextTicketNo(branchId), orderLabel, tableNumber,
       customerName, resolvedStation, note, userId
     );
     const stmt = db.prepare(
@@ -179,6 +180,76 @@ export function createTicket({
   });
   run();
   return queueId;
+}
+
+/**
+ * Enqueue the prepared lines of a parked (held) order.
+ *
+ * A hold is an unpaid cart, but the drinks/food still have to be made — so the
+ * ticket has to exist at hold time, not only after payment. Mirrors
+ * `enqueueFromTransaction`: same `isPreparedItem` filter, so retail lines never
+ * reach the bar. The ticket keeps `hold_order_id` instead of `transaction_id`,
+ * which is what lets `settleHoldTicket` retire it once the cart is resumed and
+ * paid (otherwise the same order would be prepared twice).
+ *
+ * Returns the new queue id, or null when the hold has nothing to prepare.
+ */
+export function enqueueFromHold({ companyId, branchId, userId, holdId, hold, items = [] }) {
+  const prodStmt = db.prepare('SELECT category_id, is_variant_parent FROM products WHERE id = ?');
+  const lines = (items || [])
+    .filter((i) => {
+      if (!i || !(i.product_name || i.product_id)) return false;
+      // A custom line with no product link has no category to route on, but it is
+      // still something the counter asked for — keep it, as a waiter ticket would.
+      if (!i.product_id) return true;
+      return isPreparedItem(prodStmt.get(i.product_id));
+    })
+    .map((i) => ({
+      product_id: i.product_id || null,
+      product_name: i.product_name || 'Item',
+      variant_label: i.variant_label || null,
+      quantity: Number(i.quantity) || 1,
+      note: i.note || null
+    }));
+  if (!lines.length) return null;
+
+  const queueId = createTicket({
+    companyId,
+    branchId,
+    userId,
+    holdOrderId: holdId,
+    orderLabel: hold.label || null,
+    tableNumber: hold.table_number || null,
+    customerName: hold.customer_name || null,
+    note: hold.note || null,
+    items: lines
+  });
+  if (!queueId) return null;
+
+  // Stamp the ticket with when the order was actually parked, so the board's
+  // turnaround timer reflects the customer's wait rather than the insert time.
+  if (hold.created_at) {
+    db.prepare('UPDATE order_queue SET created_at = ? WHERE id = ?').run(hold.created_at, queueId);
+  }
+  return queueId;
+}
+
+/**
+ * Retire the ticket raised for a hold, once that hold has become a paid sale.
+ *
+ * Only deletes tickets nobody has touched yet (`status = 'queue'`). If the bar
+ * already started or finished the drinks that work is real, so its history is
+ * left intact — deleting it would also erase the audit trail of who made what.
+ *
+ * Returns the number of tickets removed.
+ */
+export function settleHoldTicket({ companyId, holdId }) {
+  if (!companyId || !holdId) return 0;
+  const rows = db
+    .prepare("SELECT id FROM order_queue WHERE company_id = ? AND hold_order_id = ? AND status = 'queue' AND transaction_id IS NULL")
+    .all(companyId, holdId);
+  for (const r of rows) db.prepare('DELETE FROM order_queue WHERE id = ?').run(r.id);
+  return rows.length;
 }
 
 /**

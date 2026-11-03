@@ -1,7 +1,8 @@
 import express from 'express';
 import { db } from '../db.js';
-import { authRequired, assertBranchAccess } from '../auth.js';
+import { authRequired, audit, assertBranchAccess } from '../auth.js';
 import { id, wrap, badRequest, notFound, money } from '../lib/helpers.js';
+import { enqueueFromHold, settleHoldTicket } from '../lib/kitchen.js';
 
 const router = express.Router();
 
@@ -75,7 +76,29 @@ router.post('/holds', authRequired, wrap((req, res) => {
     }
   });
   run();
-  res.status(201).json(loadHold(hid, req.user.company_id));
+
+  // Send the prepared lines to the kitchen display, exactly as a paid sale does.
+  // Best-effort and outside the transaction above: a queue failure must never
+  // lose a parked cart, the same guarantee `persistTransaction` gives.
+  let queueId = null;
+  try {
+    const hold = loadHold(hid, req.user.company_id);
+    queueId = enqueueFromHold({
+      companyId: req.user.company_id,
+      branchId: branch_id,
+      userId: req.user.sub,
+      holdId: hid,
+      hold,
+      items: prepared
+    });
+  } catch {
+    queueId = null;
+  }
+  if (queueId) {
+    audit({ company_id: req.user.company_id, branch_id, user_id: req.user.sub, action: 'queue.create', entity: 'order_queue', entity_id: queueId, detail: { source: 'hold', items: prepared.length }, ip: req.ip });
+  }
+
+  res.status(201).json({ ...loadHold(hid, req.user.company_id), queue_id: queueId });
 }));
 
 /** PUT /holds/:id — update a parked cart (add/remove items before resuming). */
@@ -107,16 +130,51 @@ router.put('/holds/:id', authRequired, wrap((req, res) => {
     if (note !== undefined) db.prepare('UPDATE hold_orders SET note = ? WHERE id = ?').run(note, h.id);
   });
   run();
+
+  // Keep the kitchen ticket in step with the edited cart. Only re-raised while the
+  // bar has not touched it — once started, the original ticket is the record of
+  // what was actually made, so rewriting it would falsify that history.
+  try {
+    const fresh = loadHold(req.params.id, req.user.company_id);
+    const untouched = db
+      .prepare("SELECT id FROM order_queue WHERE company_id = ? AND hold_order_id = ? AND status = 'queue' AND transaction_id IS NULL")
+      .all(req.user.company_id, h.id);
+    if (untouched.length) {
+      settleHoldTicket({ companyId: req.user.company_id, holdId: h.id });
+      enqueueFromHold({
+        companyId: req.user.company_id,
+        branchId: h.branch_id,
+        userId: req.user.sub,
+        holdId: h.id,
+        hold: fresh,
+        items: fresh.items
+      });
+    }
+  } catch {
+    // Non-fatal: the cart edit is already committed.
+  }
+
   res.json(loadHold(h.id, req.user.company_id));
 }));
 
-/** DELETE /holds/:id — discard a parked cart (or after it was resumed into a sale). */
+/**
+ * DELETE /holds/:id — discard a parked cart (or after it was resumed into a sale).
+ *
+ * The hold may have raised a kitchen ticket at park time. If that ticket is still
+ * untouched it is removed with the hold; a ticket the bar already started is left
+ * in place so its history survives. Pass `?keep_queue=1` to always keep it.
+ */
 router.delete('/holds/:id', authRequired, wrap((req, res) => {
   const h = loadHold(req.params.id, req.user.company_id);
   if (!h) return notFound(res, 'Hold order not found');
   if (!assertBranchAccess(req, res, h.branch_id)) return;
+
+  let queueRemoved = 0;
+  if (!req.query.keep_queue) {
+    queueRemoved = settleHoldTicket({ companyId: req.user.company_id, holdId: h.id });
+  }
   db.prepare('DELETE FROM hold_orders WHERE id = ?').run(h.id);
-  res.json({ ok: true });
+  res.json({ ok: true, queue_removed: queueRemoved });
 }));
 
 export default router;

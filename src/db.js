@@ -260,6 +260,7 @@ export function initSchema() {
     company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
     branch_id TEXT NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
     transaction_id TEXT REFERENCES transactions(id) ON DELETE SET NULL,
+    hold_order_id TEXT REFERENCES hold_orders(id) ON DELETE SET NULL,
     ticket_no INTEGER,
     order_label TEXT,
     table_number TEXT,
@@ -376,6 +377,7 @@ const MIGRATIONS = {
   shifts: [['note', 'TEXT'], ['cash_sales', 'REAL DEFAULT 0'], ['non_cash_sales', 'REAL DEFAULT 0']],
   devices: [['app_version', 'TEXT'], ['platform', 'TEXT'], ['device_key', 'TEXT'], ['revoked_reason', 'TEXT']],
   stock_transfers: [['rejected_reason', 'TEXT']],
+  order_queue: [['hold_order_id', 'TEXT']],
   companies: [['currency', "TEXT DEFAULT 'IDR'"], ['timezone', "TEXT DEFAULT 'Asia/Jakarta'"], ['tax_percent', 'REAL DEFAULT 0'], ['logo_url', 'TEXT']],
   roles: [['description', 'TEXT'], ['updated_at', 'TEXT']]
 };
