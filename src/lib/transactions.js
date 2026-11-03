@@ -73,6 +73,62 @@ export function priceCart({ companyId, branchId, items, discount = 0, taxPercent
 /**
  * Persist a priced cart.
  *  - clientUuid: idempotency key (offline sync) — a replay returns the existing row
+/**
+ * Stock policy for checkout.
+ *
+ * Historically nothing guarded stock at the point of sale: `priceCart` only reads
+ * the `branch_products.is_available` on/off flag, and the sole quantity check in
+ * the codebase lived in POST /sync/batch. That asymmetry meant a single cashier
+ * could drive branch stock negative online, while an offline replay of the very
+ * same sale was refused as a `conflict`.
+ *
+ * `settings.allow_negative_stock` decides the behaviour:
+ *   'warn'   (default) allow the sale, report the shortfall — preserves the
+ *            behaviour every existing deployment already has, so upgrading
+ *            cannot start refusing sales at a busy counter.
+ *   'block'  refuse the sale; the caller returns a 409 with the shortfall.
+ *   'ignore' skip the check entirely — for shops that don't track stock.
+ *
+ * 'warn' rather than 'block' as the default is deliberate: some F&B operators
+ * intentionally sell past zero (the item is physically in hand, and refusing the
+ * sale corrupts the shift totals worse than a negative count).
+ */
+export function stockPolicy() {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'allow_negative_stock'").get();
+  const mode = row && row.value ? String(row.value).trim().toLowerCase() : 'warn';
+  return ['block', 'warn', 'ignore'].includes(mode) ? mode : 'warn';
+}
+
+/**
+ * Compare requested quantities against branch stock.
+ *
+ * Must be called inside the same `db.transaction()` as the decrement, so the
+ * check and the write cannot be interleaved by another checkout — otherwise the
+ * guard is decorative under concurrent tills.
+ *
+ * Returns an array of shortfalls; empty means the sale can proceed.
+ */
+export function stockShortfalls({ branchId, prepared }) {
+  const stmt = db.prepare('SELECT quantity FROM branch_stocks WHERE branch_id = ? AND product_id = ?');
+  const shortfalls = [];
+  for (const p of prepared) {
+    const row = stmt.get(branchId, p.prod.id);
+    const available = row ? row.quantity : 0;
+    if (available < p.qty) {
+      shortfalls.push({
+        product_id: p.prod.id,
+        product_name: p.prod.name,
+        requested: p.qty,
+        available
+      });
+    }
+  }
+  return shortfalls;
+}
+
+/**
+ * Persist a sale.
+ *  - totals/prepared come from priceCart
  *  - createdAt: original timestamp when the sale happened offline
  *  - offline: flag the row as synced from an offline device
  */
@@ -95,8 +151,27 @@ export function persistTransaction({ companyId, branchId, userId, deviceId, clie
   const txId = id();
   const code = client.code || 'TRX-' + Date.now().toString(36).toUpperCase() + Math.floor(Math.random() * 90 + 10);
   const t = client.totals;
+  // Populated inside the transaction below; surfaced to the caller so 'warn' mode
+  // can tell the cashier the sale oversold without having refused it.
+  let stockReport = [];
 
   const run = db.transaction(() => {
+    // Enforce the configured stock policy inside the transaction, so the check and
+    // the decrement below cannot be interleaved by a concurrent checkout. A
+    // 'block' refusal throws, which rolls back cleanly because nothing has been
+    // written yet. 'warn' records the shortfall and lets the sale through.
+    const policy = stockPolicy();
+    if (policy !== 'ignore') {
+      stockReport = stockShortfalls({ branchId, prepared: client.prepared });
+      if (policy === 'block' && stockReport.length) {
+        const err = new Error('Stok tidak cukup');
+        err.status = 409;
+        err.code = 'INSUFFICIENT_STOCK';
+        err.shortfalls = stockReport;
+        throw err;
+      }
+    }
+
     db.prepare(
       `INSERT INTO transactions (id, company_id, branch_id, user_id, shift_id, code, receipt_number, subtotal, discount, tax, tax_percent,
          total, payment_method, payment_detail, cash_received, change_due, status, note, created_at,
@@ -157,7 +232,7 @@ export function persistTransaction({ companyId, branchId, userId, deviceId, clie
     db.prepare('UPDATE shifts SET cash_sales = COALESCE(cash_sales,0) + ?, non_cash_sales = COALESCE(non_cash_sales,0) + ? WHERE id = ?')
       .run(cash, money(t.total - cash), shift.id);
   }
-  return { id: txId, duplicate: false, queueId };
+  return { id: txId, duplicate: false, queueId, stockShortfalls: stockReport };
 }
 
 /** Fetch a transaction with items, branch & cashier names. */

@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 import { db } from '../db.js';
 import { authRequired, requirePermission, audit, assertBranchAccess, scopedBranchIds } from '../auth.js';
 import { wrap, badRequest, notFound, money, txFilter, applyStockDelta } from '../lib/helpers.js';
-import { priceCart, persistTransaction, getTransaction } from '../lib/transactions.js';
+import { priceCart, persistTransaction, getTransaction, stockPolicy, stockShortfalls } from '../lib/transactions.js';
 import { isEdge } from '../edge.js';
 import { enqueueOutbox } from '../lib/edgeOutbox.js';
 
@@ -34,24 +34,37 @@ router.post('/transactions', authRequired, wrap((req, res) => {
     return badRequest(res, 'cash_received atau payments wajib diisi untuk pembayaran tunai');
   }
 
-  const { id: txId, duplicate } = persistTransaction({
-    companyId: req.user.company_id,
-    branchId: branch_id,
-    userId: req.user.sub,
-    deviceId: req.body.device_id,
-    client: {
-      totals: priced.totals,
-      prepared: priced.prepared,
-      payment_method: req.body.payment_method || 'cash',
-      note: req.body.note,
-      client_uuid: req.body.client_uuid || null,
-      order_label: req.body.order_label,
-      table_number: req.body.table_number,
-      customer_name: req.body.customer_name,
-      reference_id: req.body.reference_id,
-      code: req.body.code
+  // Stock policy: 'block' throws a 409 from inside persistTransaction (the check
+  // and the decrement must share one SQLite transaction). Translate it into the
+  // same JSON shape /sync/batch uses for its conflict, so the UI has one shape to
+  // handle. 'warn' returns shortfalls on the success path instead.
+  let persisted;
+  try {
+    persisted = persistTransaction({
+      companyId: req.user.company_id,
+      branchId: branch_id,
+      userId: req.user.sub,
+      deviceId: req.body.device_id,
+      client: {
+        totals: priced.totals,
+        prepared: priced.prepared,
+        payment_method: req.body.payment_method || 'cash',
+        note: req.body.note,
+        client_uuid: req.body.client_uuid || null,
+        order_label: req.body.order_label,
+        table_number: req.body.table_number,
+        customer_name: req.body.customer_name,
+        reference_id: req.body.reference_id,
+        code: req.body.code
+      }
+    });
+  } catch (e) {
+    if (e && e.code === 'INSUFFICIENT_STOCK') {
+      return res.status(409).json({ error: e.message, code: e.code, shortfalls: e.shortfalls });
     }
-  });
+    throw e;
+  }
+  const { id: txId, duplicate, stockShortfalls } = persisted;
 
   // Edge mode: the sale is real locally, but the cloud has not seen it yet. Copy
   // the replay payload into the outbox. This is the same shape POST /sync/batch
@@ -79,7 +92,11 @@ router.post('/transactions', authRequired, wrap((req, res) => {
   }
 
   audit({ company_id: req.user.company_id, branch_id, user_id: req.user.sub, action: 'transaction.create', entity: 'transaction', entity_id: txId, detail: { total: priced.totals.total, duplicate }, ip: req.ip });
-  res.status(duplicate ? 200 : 201).json({ ...getTransaction(txId, req.user.company_id), duplicate });
+  const body = { ...getTransaction(txId, req.user.company_id), duplicate };
+  // 'warn' mode only: the sale went through, but it oversold. The UI can toast
+  // this without treating the sale as failed.
+  if (stockShortfalls && stockShortfalls.length) body.stock_warnings = stockShortfalls;
+  res.status(duplicate ? 200 : 201).json(body);
 }));
 
 /** POST /transactions/quote — price a cart without persisting (cart preview / validation). */

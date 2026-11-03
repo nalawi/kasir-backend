@@ -2,7 +2,7 @@ import express from 'express';
 import { db } from '../db.js';
 import { authRequired, requirePermission, audit, assertBranchAccess } from '../auth.js';
 import { id, wrap, badRequest } from '../lib/helpers.js';
-import { priceCart, persistTransaction } from '../lib/transactions.js';
+import { priceCart, persistTransaction, stockPolicy, stockShortfalls } from '../lib/transactions.js';
 
 const router = express.Router();
 
@@ -78,13 +78,15 @@ router.post('/sync/batch', authRequired, wrap((req, res) => {
     }
 
     // Conflict detection: replaying the sale would push branch stock below zero.
-    const shortfalls = priced.prepared
-      .map((p) => {
-        const row = db.prepare('SELECT quantity FROM branch_stocks WHERE branch_id = ? AND product_id = ?').get(branch_id, p.prod.id);
-        const available = row ? row.quantity : 0;
-        return available < p.qty ? { product_id: p.prod.id, product_name: p.prod.name, requested: p.qty, available } : null;
-      })
-      .filter(Boolean);
+    //
+    // This is the only stock guard that existed before the checkout policy was
+    // added, and it applies whichever mode is configured — an offline replay is
+    // reconciled after the fact, so 'warn' cannot be honoured by showing a toast
+    // to a cashier who has already gone home. 'ignore' is the one mode that turns
+    // it off, because a shop that does not track stock must not have every replay
+    // parked in the conflict queue.
+    const policy = stockPolicy();
+    const shortfalls = policy === 'ignore' ? [] : stockShortfalls({ branchId: branch_id, prepared: priced.prepared });
 
     if (shortfalls.length) {
       const detail = { error: 'Stok tidak cukup saat sinkronisasi', shortfalls };

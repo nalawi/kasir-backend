@@ -55,7 +55,10 @@ const settings = {
   currency: 'IDR',
   locale: 'id-ID',
   receipt_footer: 'Terima kasih atas kunjungan Anda!',
-  low_stock_default: '10'
+  low_stock_default: '10',
+  // 'warn' | 'block' | 'ignore' — see stockPolicy() in src/lib/transactions.js.
+  // Defaults to 'warn' so an upgrade never starts refusing sales at the counter.
+  allow_negative_stock: 'warn'
 };
 for (const [k, v] of Object.entries(settings)) insertSetting.run(k, v);
 
