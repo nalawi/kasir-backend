@@ -21,6 +21,7 @@ import reportRoutes from './routes/report.routes.js';
 import syncRoutes from './routes/sync.routes.js';
 import auditRoutes from './routes/audit.routes.js';
 import docsRoutes from './routes/docs.routes.js';
+import settingsRoutes from './routes/settings.routes.js';
 import edgeRoutes, { upstreamUrl } from './routes/edge.routes.js';
 
 initSchema();
@@ -79,6 +80,7 @@ app.use('/api', reportRoutes);         // /reports/*
 app.use('/api', syncRoutes);           // /sync/*
 app.use('/api', auditRoutes);          // /audit-logs
 app.use('/api', docsRoutes);           // /openapi.json, /permissions
+app.use('/api', settingsRoutes);       // /settings
 // Edge-only surface: health/queue/unlock/config. Not mounted on the cloud, so a
 // cloud deployment exposes exactly the same API it did before.
 if (EDGE) app.use('/api', edgeRoutes);

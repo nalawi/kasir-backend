@@ -372,6 +372,34 @@ export function initSchema() {
   // plain TEXT here; uniqueness for client_uuid is enforced in application code.
   // ---------------------------------------------------------------------------
   migrate();
+  seedDefaultSettings();
+}
+
+/**
+ * Guarantee the money-path settings rows exist.
+ *
+ * `settings` starts empty: it is populated by `npm run seed`, which is a demo
+ * script and is not run by the service. Application code falls back to the same
+ * defaults, so behaviour is correct either way — but without the rows an operator
+ * opening the settings screen would see blanks instead of the values actually in
+ * force, and PUT /settings would report no previous value in the audit trail.
+ *
+ * INSERT OR IGNORE, so an existing value is never overwritten.
+ */
+function seedDefaultSettings() {
+  const defaults = {
+    allow_negative_stock: 'warn',
+    tax_percent: '0',
+    currency: 'IDR',
+    locale: 'id-ID',
+    receipt_footer: 'Terima kasih atas kunjungan Anda!',
+    low_stock_default: '10',
+    cash_tolerance: '5000'
+  };
+  const stmt = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
+  db.transaction(() => {
+    for (const [k, v] of Object.entries(defaults)) stmt.run(k, v);
+  })();
 }
 
 const MIGRATIONS = {

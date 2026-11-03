@@ -48,14 +48,16 @@ export async function seedCloud(api) {
     products.push({ ...p, id: productId });
   }
 
+  const cashierEmail = 'budi@uji.id';
+  const cashierPassword = 'rahasia123';
   const cashier = await api.cloud.post('/api/users', {
     token,
-    body: { name: 'Budi', email: 'budi@uji.id', password: 'rahasia123', role: 'cashier', branch_id: branchId },
+    body: { name: 'Budi', email: cashierEmail, password: cashierPassword, role: 'cashier', branch_id: branchId },
   });
   const cashierId = cashier.body.id || cashier.body.user?.id;
   await api.cloud.put(`/api/users/${cashierId}`, { token, body: { pin: CASHIER_PIN } });
 
-  return { token, branchId, products, cashierId };
+  return { token, branchId, products, cashierId, cashierEmail, cashierPassword };
 }
 
 /**
@@ -125,6 +127,22 @@ export async function cloudStock(api, branchId, productId, token) {
   const rows = Array.isArray(res.body) ? res.body : res.body?.stocks || res.body?.items || [];
   const row = rows.find((r) => r.product_id === productId);
   return row ? row.quantity : null;
+}
+
+/**
+ * Log in to the CLOUD as the seeded cashier and return that token.
+ *
+ * Distinct from `edge.edgeToken`: that one is minted by the till with the local
+ * secret, so the cloud rejects it outright. A test asserting a permission
+ * boundary on a cloud route needs a cloud-signed token for that role, or it
+ * would pass by 401 rather than by the check under test.
+ */
+export async function cloudCashierToken(api, seeded) {
+  const res = await api.cloud.post('/api/auth/login', {
+    body: { email: seeded.cashierEmail, password: seeded.cashierPassword },
+  });
+  if (res.status >= 300) throw new Error(`cashier login failed: ${JSON.stringify(res.body)}`);
+  return res.body.token;
 }
 
 /**

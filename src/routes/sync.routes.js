@@ -172,6 +172,28 @@ router.get('/sync/conflicts', authRequired, wrap((req, res) => {
   );
 }));
 
+/**
+ * Settings a till needs to operate, and nothing more.
+ *
+ * `/sync/bootstrap` used to return every row in `settings` to any caller with
+ * branch access. That is harmless only for as long as the table holds nothing
+ * sensitive — the moment a payment key or the edge upstream credentials land
+ * there, they would silently ship to every till. An allowlist keeps that from
+ * becoming someone's bad afternoon later.
+ *
+ * Keys are grouped by who consumes them:
+ *  - till identity/display: currency, locale, receipt_footer, tax_percent
+ *  - till-side policy:      allow_negative_stock (the till enforces it locally)
+ */
+const TILL_SETTING_KEYS = [
+  'currency',
+  'locale',
+  'receipt_footer',
+  'tax_percent',
+  'allow_negative_stock',
+  'low_stock_default'
+];
+
 /** GET /sync/bootstrap — full offline snapshot for a branch (catalog + stock + settings). */
 router.get('/sync/bootstrap', authRequired, wrap((req, res) => {
   const { branch_id } = req.query;
@@ -204,7 +226,12 @@ router.get('/sync/bootstrap', authRequired, wrap((req, res) => {
     branch: { id: branch.id, name: branch.name, address: branch.address, phone: branch.phone },
     categories,
     products: products.map((p) => ({ ...p, variants: variants.filter((v) => v.product_id === p.id) })),
-    settings: Object.fromEntries(db.prepare('SELECT key, value FROM settings').all().map((s) => [s.key, s.value]))
+    settings: Object.fromEntries(
+      db
+        .prepare(`SELECT key, value FROM settings WHERE key IN (${TILL_SETTING_KEYS.map(() => '?').join(',')})`)
+        .all(...TILL_SETTING_KEYS)
+        .map((s) => [s.key, s.value])
+    )
   });
 }));
 
