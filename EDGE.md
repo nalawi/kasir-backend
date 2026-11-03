@@ -64,6 +64,19 @@ that is the correct failure mode, not a bug.
 Rate limiting (`edge_login_attempts`) mirrors the cloud's lockout so a till
 cannot be brute-forced faster just because it is local.
 
+## Provisioning a till is a privileged action
+
+`POST /api/edge/pair` (choose which cloud account the till syncs as) and
+`GET /api/sync/pin-users` (hand out PIN hashes) both require `device.manage`.
+
+This is deliberate. A bcrypt hash of a 4-digit PIN has only 10,000 candidates, so
+releasing one is equivalent to releasing the PIN, and a PIN authorises
+manager-level actions such as void approval and cash handover. Without the
+permission check, any cashier could pull a manager's hash from their own session
+and crack it offline. Pairing decides whose cloud token the till reuses, which is
+the same kind of authority, so the two are gated together: whoever may pair may
+also provision offline logins.
+
 ## Prerequisites on the till
 
 * Node runtime available on `PATH` (or bundled next to the app).

@@ -1,6 +1,6 @@
 import express from 'express';
 import { db } from '../db.js';
-import { authRequired, audit, assertBranchAccess } from '../auth.js';
+import { authRequired, requirePermission, audit, assertBranchAccess } from '../auth.js';
 import { id, wrap, badRequest } from '../lib/helpers.js';
 import { priceCart, persistTransaction } from '../lib/transactions.js';
 
@@ -213,11 +213,16 @@ router.get('/sync/bootstrap', authRequired, wrap((req, res) => {
  * internet drops. This is the only place a `pin_hash` leaves the cloud.
  *
  * Guarded tighter than the public /auth/pin-users list: it needs a real session
- * (authRequired) and a branch the caller may access. The client is a loopback-
- * bound edge service that stores the result beside its own SQLite database, so
- * the blast radius of the hash being present on the device is the device itself.
+ * (authRequired), a branch the caller may access, and `device.manage`.
+ *
+ * `device.manage` is not decoration. A bcrypt hash of a 4-digit PIN has only
+ * 10,000 candidates, so handing one out is equivalent to handing out the PIN —
+ * and a PIN authorises manager-level actions (void approval, cash handover).
+ * Without the permission check any cashier could pull a manager's hash from
+ * their own low-privilege session and crack it offline. Provisioning a till is a
+ * device-management action, so it is gated like one.
  */
-router.get('/sync/pin-users', authRequired, wrap((req, res) => {
+router.get('/sync/pin-users', authRequired, requirePermission('device.manage'), wrap((req, res) => {
   const { branch_id } = req.query;
   if (!branch_id) return badRequest(res, 'branch_id required');
   if (!assertBranchAccess(req, res, branch_id)) return;

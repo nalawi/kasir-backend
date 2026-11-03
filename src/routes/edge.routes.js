@@ -175,7 +175,17 @@ router.post('/edge/drain', authRequired, wrap(async (req, res) => {
  * Re-running this refreshes the stored token (e.g. after a password change or
  * when the old one expires).
  */
-router.post('/edge/pair', wrap(async (req, res) => {
+/**
+ * POST /edge/pair  { email, password }
+ *
+ * Provisioning a till is device management, so it needs a `device.manage`
+ * session. Pairing also decides *whose* cloud token the till syncs with, which
+ * is too much authority to hand to any cashier who can reach the settings
+ * screen. The paired user's cloud token is what bootstrap then uses to fetch
+ * PIN hashes, so gating both keeps them in step: whoever may pair may also
+ * provision offline logins.
+ */
+router.post('/edge/pair', authRequired, requirePermission('device.manage'), wrap(async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return badRequest(res, 'email & password required');
   if (!upstreamUrl()) return badRequest(res, 'Server pusat belum diatur');
