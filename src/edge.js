@@ -59,14 +59,28 @@ export function localSecret(dataDir = edgeDataDir()) {
   return cachedSecret;
 }
 
-/** Let browser-based edge clients (Vite on :5173) call the local service. */
+/**
+ * Let browser-based edge clients call the local service.
+ *
+ * Covers three kinds of client, all of which are local by construction:
+ *   * the Vite dev server (http://localhost:5173);
+ *   * the packaged app's own page, which Tauri serves from `tauri://localhost`
+ *     on macOS and `http://tauri.localhost` on Windows/Linux. Neither matches
+ *     an http(s) loopback, so they were previously refused the
+ *     `Access-Control-Allow-Origin` header; WebKit then discarded every
+ *     response and `fetch` threw, which the API client reports as
+ *     "Tidak ada koneksi ke server" even though the service was healthy.
+ *     That made login and company registration impossible in the .app.
+ *   * any other page served from this machine.
+ *
+ * The service binds only to 127.0.0.1, so a remote page can neither reach it
+ * nor forge the `tauri:` scheme — widening this list does not expose the till.
+ */
 export function edgeCorsOptions() {
-  // Any loopback origin is allowed; the service never binds to a public address,
-  // so the CORS header cannot be abused from a remote page.
-  const loopback = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i;
+  const local = /^(https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?|tauri:\/\/localhost|https?:\/\/tauri\.localhost)$/i;
   return {
     origin(origin, cb) {
-      if (!origin || loopback.test(origin)) return cb(null, true);
+      if (!origin || local.test(origin)) return cb(null, true);
       cb(null, false);
     },
   };

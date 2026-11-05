@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "test": "node --test --test-concurrency=1 test/edge-sync.test.mjs test/stock-policy.test.mjs test/settings.test.mjs",
+    "test": "node --test --test-concurrency=1 test/edge-sync.test.mjs test/edge-cors.test.mjs test/stock-policy.test.mjs test/settings.test.mjs test/daily-brief.test.mjs test/transaction-timestamps.test.mjs test/product-import.test.mjs test/product-import-routes.test.mjs test/backup-restore.test.mjs",
     "seed": "node src/seed.js",
     "reset": "rm -f data/pos.db && npm run seed"
   },

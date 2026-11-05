@@ -157,13 +157,32 @@ export function canAccessBranch(req, branchId) {
   return scopedBranchIds(req).includes(branchId);
 }
 
-/** Guard for write endpoints. Sends the 403 itself and returns false when denied. */
+/**
+ * Guard for write endpoints. Sends the 403 itself and returns false when denied.
+ *
+ * The message deliberately distinguishes the two causes, because they look
+ * identical from the UI and have completely different fixes:
+ *
+ * - the branch does not belong to the token's company at all — almost always a
+ *   till still holding a branch id from an earlier pairing to a *different*
+ *   company (typically after the cloud database was reseeded). Nothing the user
+ *   can do in Settings fixes it; the client must re-pick a branch from `/me`.
+ * - the branch is real but outside this user's narrower scope — a genuine
+ *   permission boundary for a cashier or single-outlet manager.
+ */
 export function assertBranchAccess(req, res, branchId) {
-  if (!canAccessBranch(req, branchId)) {
-    res.status(403).json({ error: 'Forbidden: branch not in your scope' });
-    return false;
-  }
-  return true;
+  if (canAccessBranch(req, branchId)) return true;
+
+  const foreign = !db
+    .prepare('SELECT 1 FROM branches WHERE id = ? AND company_id = ?')
+    .get(branchId, req.user.company_id);
+
+  res.status(403).json({
+    error: foreign
+      ? 'Forbidden: branch not in your scope (cabang ini bukan milik perusahaan Anda — pilih ulang cabang)'
+      : 'Forbidden: branch not in your scope',
+  });
+  return false;
 }
 
 export function audit({ company_id, branch_id, user_id, action, entity, entity_id, detail, ip }) {

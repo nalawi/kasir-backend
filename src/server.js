@@ -22,6 +22,7 @@ import syncRoutes from './routes/sync.routes.js';
 import auditRoutes from './routes/audit.routes.js';
 import docsRoutes from './routes/docs.routes.js';
 import settingsRoutes from './routes/settings.routes.js';
+import backupRoutes from './routes/backup.routes.js';
 import edgeRoutes, { upstreamUrl } from './routes/edge.routes.js';
 
 initSchema();
@@ -60,8 +61,24 @@ app.use(
 );
 
 /* ------------------------------- HEALTH ------------------------------- */
+// `mode` and `features` let a client tell the two roles apart. The till's own
+// service and the cloud API share every route, so without this the Products page
+// cannot know that a catalog import would land in a replica that the next
+// bootstrap overwrites (see the import gate in ProductsPage).
 app.get('/api/health', (req, res) =>
-  res.json({ ok: true, service: 'pos-backend', version: '1.0.0', time: new Date().toISOString() })
+  res.json({
+    ok: true,
+    service: 'pos-backend',
+    version: '1.0.0',
+    mode: EDGE ? 'edge' : 'cloud',
+    features: {
+      // Product import writes the local catalogue. On a till that copy is a
+      // replica: it is never pushed upstream and is replaced wholesale on the
+      // next bootstrap, so the import is offered on the cloud only.
+      productImport: !EDGE,
+    },
+    time: new Date().toISOString(),
+  })
 );
 
 /* ------------------------------- ROUTES ------------------------------- */
@@ -81,6 +98,14 @@ app.use('/api', syncRoutes);           // /sync/*
 app.use('/api', auditRoutes);          // /audit-logs
 app.use('/api', docsRoutes);           // /openapi.json, /permissions
 app.use('/api', settingsRoutes);       // /settings
+// Restore uploads a whole bundle in one JSON body, which for a real shop runs to
+// tens of megabytes — well past the global 5mb parser above. Registered ahead of
+// the router so its own limit wins for these two paths only.
+app.use(
+  '/api',
+  express.json({ limit: process.env.BACKUP_BODY_LIMIT || '200mb' }),
+  backupRoutes
+);
 // Edge-only surface: health/queue/unlock/config. Not mounted on the cloud, so a
 // cloud deployment exposes exactly the same API it did before.
 if (EDGE) app.use('/api', edgeRoutes);

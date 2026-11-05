@@ -222,7 +222,15 @@ router.get('/sync/bootstrap', authRequired, wrap((req, res) => {
   const categories = db.prepare('SELECT * FROM categories WHERE company_id = ? ORDER BY name').all(req.user.company_id);
   res.json({
     synced_at: new Date().toISOString(),
-    company: { id: company.id, name: company.name, currency: company.currency || 'IDR', tax_percent: company.tax_percent || 0 },
+    company: {
+      id: company.id,
+      name: company.name,
+      currency: company.currency || 'IDR',
+      tax_percent: company.tax_percent || 0,
+      // The till resolves "today" for its reports with this, so dropping it here
+      // made every edge report fall back to UTC and disagree with the cloud.
+      timezone: company.timezone || null
+    },
     branch: { id: branch.id, name: branch.name, address: branch.address, phone: branch.phone },
     categories,
     products: products.map((p) => ({ ...p, variants: variants.filter((v) => v.product_id === p.id) })),
@@ -238,8 +246,20 @@ router.get('/sync/bootstrap', authRequired, wrap((req, res) => {
 /**
  * GET /sync/pin-users?branch_id=
  *
- * PIN hashes for a branch, so a desktop till can verify PINs locally when the
- * internet drops. This is the only place a `pin_hash` leaves the cloud.
+ * The branch's staff roster for a till's replica: every active user in the
+ * branch, with `pin_hash` when they have set one. This is the only place a
+ * `pin_hash` leaves the cloud.
+ *
+ * It returns users *without* a PIN too, on purpose. Replicating only PIN-holders
+ * meant a manager who had never set a PIN silently vanished from the till: they
+ * could not unlock it, and the offline staff picker omitted them with no
+ * explanation. The till now mirrors the branch roster and the offline screen
+ * shows who can actually be used.
+ *
+ * `password_hash` is deliberately absent and must stay that way. A PIN is 10,000
+ * candidates, but an account password is the real credential — shipping its hash
+ * would make every till's SQLite file an offline-crackable credential store. The
+ * replica stores an unusable sentinel instead, so offline login is PIN-only.
  *
  * Guarded tighter than the public /auth/pin-users list: it needs a real session
  * (authRequired), a branch the caller may access, and `device.manage`.
@@ -260,7 +280,7 @@ router.get('/sync/pin-users', authRequired, requirePermission('device.manage'), 
     .prepare(
       `SELECT id, company_id, branch_id, name, email, role, avatar_url, pin_hash
        FROM users
-       WHERE branch_id = ? AND is_active = 1 AND pin_hash IS NOT NULL
+       WHERE branch_id = ? AND is_active = 1
        ORDER BY name`
     )
     .all(branch_id);

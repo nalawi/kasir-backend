@@ -128,7 +128,18 @@ router.get('/me', authRequired, (req, res) => {
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.sub);
   if (!user) return res.status(404).json({ error: 'Not found' });
   const branches = db.prepare('SELECT id, name FROM branches WHERE company_id = ? AND is_active = 1 ORDER BY name').all(user.company_id);
-  res.json({ user: publicUser(user), permissions: getPermissions(user.role, user.company_id), branches, lock: lockInfo() });
+  // The company's timezone belongs in the session payload: every screen formats
+  // timestamps on the shop's clock, and a till whose OS is set to another zone
+  // must not shift the day or the receipt time. One fetch, cached with the
+  // session so offline boot keeps the right zone too.
+  const company = db.prepare('SELECT name, timezone FROM companies WHERE id = ?').get(user.company_id) || {};
+  res.json({
+    user: publicUser(user),
+    permissions: getPermissions(user.role, user.company_id),
+    branches,
+    lock: lockInfo(),
+    company: { name: company.name || null, timezone: company.timezone || 'UTC' }
+  });
 });
 
 router.put('/me/password', authRequired, wrap((req, res) => {

@@ -26,6 +26,33 @@ export function formatRp(value, lang = 'id') {
   return `${n < 0 ? '-' : ''}Rp ${digits}`;
 }
 
+/** Local calendar day (`YYYY-MM-DD`) for `timeZone`, defaulting to UTC. */
+function localDay(timeZone, at = new Date()) {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: timeZone || 'UTC',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).format(at);
+  } catch {
+    return at.toISOString().slice(0, 10);
+  }
+}
+
+/**
+ * The current calendar day in the shop's timezone.
+ *
+ * Exported because the report routes need the same definition of "today" the
+ * brief uses. When `/reports/summary` defaulted to the UTC day and this module
+ * defaulted to the local day, the two disagreed for seven hours every night in
+ * UTC+7 — the KPI card showed today's revenue while the WhatsApp text, built for
+ * the UTC date, said "Belum ada penjualan hari ini".
+ */
+export function zoneDay(timeZone = null, at = new Date()) {
+  return localDay(timeZone, at);
+}
+
 /**
  * Convert a *local* calendar day into the UTC window that contains it.
  *
@@ -37,8 +64,8 @@ export function formatRp(value, lang = 'id') {
  * So take the requested day's 00:00 and 24:00 *in the company's zone*, then
  * convert both bounds to UTC. Falls back to a plain UTC day when no zone is set.
  */
-function dayBounds(date, timeZone = null) {
-  const d = /^\d{4}-\d{2}-\d{2}$/.test(String(date || '')) ? date : new Date().toISOString().slice(0, 10);
+export function dayBounds(date, timeZone = null) {
+  const d = /^\d{4}-\d{2}-\d{2}$/.test(String(date || '')) ? date : localDay(timeZone);
   const utcDay = { day: d, from: `${d} 00:00:00`, to: `${d} 23:59:59` };
   if (!timeZone) return utcDay;
 

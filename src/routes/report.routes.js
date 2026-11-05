@@ -1,55 +1,64 @@
 import express from 'express';
 import { db } from '../db.js';
-import { authRequired, requirePermission, scopedBranchIds } from '../auth.js';
+import { authRequired, requirePermission, scopedBranchIds, assertBranchAccess } from '../auth.js';
 import { wrap, money, txFilter, withStatuses, toCsv, sendCsv } from '../lib/helpers.js';
-import { buildDailyBrief, renderBriefText } from '../lib/dailyBrief.js';
+import { buildDailyBrief, renderBriefText, zoneDay, dayBounds } from '../lib/dailyBrief.js';
 
 const router = express.Router();
 
 /**
  * Normalise one range bound into a SQLite-comparable timestamp.
  *
- * `txFilter()` compares `t.created_at` (`YYYY-MM-DD HH:MM:SS`, UTC) against the
- * bound as a string, so a bare date is not enough:
- *   - `to=2026-11-02` would sort *before* `2026-11-02 15:24:00`, so an
- *     upper bound silently excluded the whole day (dashboard "Hari ini" = 0).
- *   - `from=2026-11-02` works, but pinning it to 00:00:00 keeps it symmetric
- *     and explicit.
- * Timezone: the app stores UTC and the client formats dates for display, so
- * expand a date-only bound to the full UTC day.
+ * Timezone: transactions are stored in UTC, but an owner's "today" is a day on
+ * the shop's clock. A bare date is therefore resolved to that *local* day and
+ * converted to the UTC window that contains it — the same rule
+ * `buildDailyBrief()` uses, so `/reports/summary` and `/reports/daily-brief` can
+ * never disagree about which sales belong to a day.
+ *
+ * (Resolving the date as a plain UTC day is what shipped before, and it made a
+ * UTC+7 shop's late-evening sales land on the wrong calendar day.)
  */
-function bound(value, endOfDay) {
+function dayWindow(value, timeZone, endOfDay) {
   const v = String(value).trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return `${v} ${endOfDay ? '23:59:59' : '00:00:00'}`;
-  return v;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+  return endOfDay ? dayBounds(v, timeZone).to : dayBounds(v, timeZone).from;
 }
 
-/** Default range: today (UTC) when from/to are omitted. */
-function range(q) {
-  const today = new Date().toISOString().slice(0, 10);
+/**
+ * Resolve a `?from`/`?to` pair into SQL bounds.
+ *
+ * A missing bound defaults to today *in the company's timezone*, and a bare date
+ * anywhere is expanded to the local day's full UTC window. Already-timestamped
+ * bounds are passed through untouched so callers can still ask for exact instants.
+ */
+function range(q, timeZone = null) {
+  const today = zoneDay(timeZone);
   return {
-    from: q.from ? bound(q.from, false) : `${today} 00:00:00`,
-    to: q.to ? bound(q.to, true) : `${today} 23:59:59`
+    from: q.from ? dayWindow(q.from, timeZone, false) : dayBounds(today, timeZone).from,
+    to: q.to ? dayWindow(q.to, timeZone, true) : dayBounds(today, timeZone).to
   };
 }
 
 function scopeFor(req, res, branchId) {
   const scope = scopedBranchIds(req);
   if (branchId) {
-    if (!scope.includes(branchId)) {
-      res.status(403).json({ error: 'Forbidden: branch not in your scope' });
-      return null;
-    }
+    // Shared guard so the 403 explains itself (foreign company vs. narrow scope).
+    if (!assertBranchAccess(req, res, branchId)) return null;
     return [branchId];
   }
   return scope;
+}
+
+/** The company row behind the current request, for its timezone and name. */
+function companyOf(req) {
+  return db.prepare('SELECT name, timezone FROM companies WHERE id = ?').get(req.user.company_id);
 }
 
 /** GET /reports/summary — dashboard KPIs (today vs. previous period). */
 router.get('/reports/summary', authRequired, requirePermission('report.view_all', 'report.view_branch'), wrap((req, res) => {
   const branchIds = scopeFor(req, res, req.query.branch_id);
   if (!branchIds) return;
-  const { from, to } = range(req.query);
+  const { from, to } = range(req.query, companyOf(req)?.timezone || null);
 
   const { where, params } = txFilter({ companyId: req.user.company_id, branchIds, from, to });
   const agg = db
@@ -115,7 +124,7 @@ router.get('/reports/summary', authRequired, requirePermission('report.view_all'
 router.get('/reports/sales', authRequired, requirePermission('report.view_all', 'report.view_branch'), wrap((req, res) => {
   const branchIds = scopeFor(req, res, req.query.branch_id);
   if (!branchIds) return;
-  const { from, to } = range(req.query);
+  const { from, to } = range(req.query, companyOf(req)?.timezone || null);
   const { where, params } = txFilter({ companyId: req.user.company_id, branchIds, from, to });
   const rows = db
     .prepare(
@@ -150,7 +159,7 @@ router.get('/reports/sales', authRequired, requirePermission('report.view_all', 
 router.get('/reports/products', authRequired, requirePermission('report.view_all', 'report.view_branch'), wrap((req, res) => {
   const branchIds = scopeFor(req, res, req.query.branch_id);
   if (!branchIds) return;
-  const { from, to } = range(req.query);
+  const { from, to } = range(req.query, companyOf(req)?.timezone || null);
   const { where, params } = txFilter({ companyId: req.user.company_id, branchIds, from, to });
   const order = req.query.low === '1' ? 'quantity ASC' : 'quantity DESC';
   const rows = db
@@ -180,7 +189,7 @@ router.get('/reports/products', authRequired, requirePermission('report.view_all
 router.get('/reports/cashiers', authRequired, requirePermission('report.view_all', 'report.view_branch'), wrap((req, res) => {
   const branchIds = scopeFor(req, res, req.query.branch_id);
   if (!branchIds) return;
-  const { from, to } = range(req.query);
+  const { from, to } = range(req.query, companyOf(req)?.timezone || null);
   const { where, params } = txFilter({ companyId: req.user.company_id, branchIds, from, to });
   const rows = db
     .prepare(
@@ -215,7 +224,7 @@ router.get('/reports/cashiers', authRequired, requirePermission('report.view_all
 router.get('/reports/profit', authRequired, requirePermission('report.view_profit', 'report.view_all'), wrap((req, res) => {
   const branchIds = scopeFor(req, res, req.query.branch_id);
   if (!branchIds) return;
-  const { from, to } = range(req.query);
+  const { from, to } = range(req.query, companyOf(req)?.timezone || null);
   const { where, params } = txFilter({ companyId: req.user.company_id, branchIds, from, to });
   const totals = db
     .prepare(
@@ -267,7 +276,7 @@ router.get('/reports/daily-brief', authRequired, requirePermission('report.view_
   if (!branchIds) return;
   const lang = req.query.lang === 'en' ? 'en' : 'id';
 
-  const company = db.prepare('SELECT name, timezone FROM companies WHERE id = ?').get(req.user.company_id);
+  const company = companyOf(req);
   const brief = buildDailyBrief({
     companyId: req.user.company_id,
     branchIds,
@@ -285,7 +294,7 @@ router.get('/reports/daily-brief/text', authRequired, requirePermission('report.
   if (!branchIds) return;
   const lang = req.query.lang === 'en' ? 'en' : 'id';
 
-  const company = db.prepare('SELECT name, timezone FROM companies WHERE id = ?').get(req.user.company_id);
+  const company = companyOf(req);
   const brief = buildDailyBrief({
     companyId: req.user.company_id,
     branchIds,
@@ -300,7 +309,7 @@ router.get('/reports/daily-brief/text', authRequired, requirePermission('report.
 router.get('/reports/export/transactions.csv', authRequired, requirePermission('report.export', 'report.view_all', 'report.view_branch'), wrap((req, res) => {
   const branchIds = scopeFor(req, res, req.query.branch_id);
   if (!branchIds) return;
-  const { from, to } = range(req.query);
+  const { from, to } = range(req.query, companyOf(req)?.timezone || null);
   const { where, params } = txFilter({
     companyId: req.user.company_id, branchIds, from, to,
     statuses: req.query.status ? req.query.status.split(',') : ['completed', 'voided', 'refunded']
@@ -343,7 +352,7 @@ router.get('/reports/export/transactions.csv', authRequired, requirePermission('
 router.get('/reports/export/products.csv', authRequired, requirePermission('report.export', 'report.view_all', 'report.view_branch'), wrap((req, res) => {
   const branchIds = scopeFor(req, res, req.query.branch_id);
   if (!branchIds) return;
-  const { from, to } = range(req.query);
+  const { from, to } = range(req.query, companyOf(req)?.timezone || null);
   const { where, params } = txFilter({ companyId: req.user.company_id, branchIds, from, to });
   const rows = db
     .prepare(
@@ -397,7 +406,7 @@ router.get('/reports/export/stock.csv', authRequired, requirePermission('report.
 router.get('/reports/export/shifts.csv', authRequired, requirePermission('report.export', 'report.view_all', 'report.view_branch'), wrap((req, res) => {
   const branchIds = scopeFor(req, res, req.query.branch_id);
   if (!branchIds) return;
-  const { from, to } = range(req.query);
+  const { from, to } = range(req.query, companyOf(req)?.timezone || null);
   const rows = db
     .prepare(
       `SELECT s.opened_at, s.closed_at, s.status, b.name AS branch, u.name AS cashier,

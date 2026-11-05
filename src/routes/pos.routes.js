@@ -2,12 +2,37 @@ import express from 'express';
 import bcrypt from 'bcryptjs';
 import { db } from '../db.js';
 import { authRequired, requirePermission, audit, assertBranchAccess, scopedBranchIds } from '../auth.js';
-import { wrap, badRequest, notFound, money, txFilter, applyStockDelta } from '../lib/helpers.js';
+import { wrap, badRequest, notFound, money, txFilter, applyStockDelta, toIso } from '../lib/helpers.js';
 import { priceCart, persistTransaction, getTransaction, stockPolicy, stockShortfalls } from '../lib/transactions.js';
 import { isEdge } from '../edge.js';
 import { enqueueOutbox } from '../lib/edgeOutbox.js';
 
 const router = express.Router();
+
+/**
+ * Mark a stored timestamp as UTC on the way out.
+ *
+ * `transactions.created_at` holds `YYYY-MM-DD HH:MM:SS` in UTC, with no offset
+ * marker. Sent as-is, every browser parses it as *local* wall-clock time, so a
+ * till in Jakarta reads an 08:50 WIB sale (01:50 UTC) as 01:50 and prints a
+ * receipt an hour and seven hours off. `toIso()` appends the `Z` that says
+ * "this is UTC"; the client then formats it in the shop's timezone.
+ *
+ * Values that already carry `T`/`Z` (edge payloads, hand-built rows) pass through.
+ */
+function stamp(value) {
+  return toIso(value);
+}
+
+/** Rewrite the timestamp columns of a transaction row so the client can trust them. */
+function stampRow(row) {
+  if (!row) return row;
+  if (row.created_at) row.created_at = stamp(row.created_at);
+  if (row.updated_at) row.updated_at = stamp(row.updated_at);
+  if (row.voided_at) row.voided_at = stamp(row.voided_at);
+  return row;
+}
+
 
 /** POST /transactions — live checkout from the POS screen. */
 router.post('/transactions', authRequired, wrap((req, res) => {
@@ -92,7 +117,7 @@ router.post('/transactions', authRequired, wrap((req, res) => {
   }
 
   audit({ company_id: req.user.company_id, branch_id, user_id: req.user.sub, action: 'transaction.create', entity: 'transaction', entity_id: txId, detail: { total: priced.totals.total, duplicate }, ip: req.ip });
-  const body = { ...getTransaction(txId, req.user.company_id), duplicate };
+  const body = { ...stampRow(getTransaction(txId, req.user.company_id)), duplicate };
   // 'warn' mode only: the sale went through, but it oversold. The UI can toast
   // this without treating the sale as failed.
   if (stockShortfalls && stockShortfalls.length) body.stock_warnings = stockShortfalls;
@@ -130,9 +155,7 @@ router.get('/transactions', authRequired, wrap((req, res) => {
   const { from, to, cashier_id, status, payment_method, q, limit = 50, offset = 0 } = req.query;
   const scope = scopedBranchIds(req);
   const branchIds = req.query.branch_id ? [req.query.branch_id] : scope;
-  if (req.query.branch_id && !scope.includes(req.query.branch_id)) {
-    return res.status(403).json({ error: 'Forbidden: branch not in your scope' });
-  }
+  if (req.query.branch_id && !assertBranchAccess(req, res, req.query.branch_id)) return;
   const { where, params } = txFilter({
     companyId: req.user.company_id,
     branchIds,
@@ -158,14 +181,15 @@ router.get('/transactions', authRequired, wrap((req, res) => {
        WHERE ${fullWhere} ORDER BY t.created_at DESC LIMIT ? OFFSET ?`
     )
     .all(...params, ...extraParams, Number(limit), Number(offset));
-  res.json({ total, limit: Number(limit), offset: Number(offset), rows });
+  // Timestamps leave as ISO-8601 UTC (`...Z`) — see `stampRow`.
+  res.json({ total, limit: Number(limit), offset: Number(offset), rows: rows.map(stampRow) });
 }));
 
 router.get('/transactions/:id', authRequired, wrap((req, res) => {
   const t = getTransaction(req.params.id, req.user.company_id);
   if (!t) return notFound(res, 'Transaction not found');
   if (!assertBranchAccess(req, res, t.branch_id)) return;
-  res.json(t);
+  res.json(stampRow(t));
 }));
 
 /** POST /transactions/:id/void — request a void. Cashiers need manager approval. */
@@ -210,7 +234,7 @@ router.post('/transactions/:id/void', authRequired, wrap((req, res) => {
   });
   run();
   audit({ company_id: req.user.company_id, branch_id: t.branch_id, user_id: req.user.sub, action: 'transaction.void', entity: 'transaction', entity_id: t.id, detail: { reason, approved_by: approvedBy, total: t.total }, ip: req.ip });
-  res.json(getTransaction(t.id, req.user.company_id));
+  res.json(stampRow(getTransaction(t.id, req.user.company_id)));
 }));
 
 /** GET /transactions/:id/receipt — structured receipt for 58/80mm thermal printing. */
@@ -221,13 +245,15 @@ router.get('/transactions/:id/receipt', authRequired, wrap((req, res) => {
   const branch = db.prepare('SELECT * FROM branches WHERE id = ?').get(t.branch_id) || {};
   const company = db.prepare('SELECT * FROM companies WHERE id = ?').get(req.user.company_id) || {};
   res.json({
-    company: { name: company.name, address: company.address, phone: company.phone, logo_url: company.logo_url, currency: company.currency },
+    // `timezone` travels with the receipt so the printer renders the sale on the
+    // shop's clock even when the printing device is set to another one.
+    company: { name: company.name, address: company.address, phone: company.phone, logo_url: company.logo_url, currency: company.currency, timezone: company.timezone || 'UTC' },
     branch: { name: branch.name, address: branch.address, phone: branch.phone },
     header: {
       code: t.code,
       receipt_number: t.receipt_number || t.code,
       cashier: t.cashier_name,
-      created_at: t.created_at,
+      created_at: stamp(t.created_at),
       order_label: t.order_label,
       table_number: t.table_number,
       customer_name: t.customer_name

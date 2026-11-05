@@ -56,7 +56,7 @@ router.get('/shifts', authRequired, wrap((req, res) => {
   const conds = [];
   const params = [];
   const branchIds = branch_id ? [branch_id] : scope;
-  if (branch_id && !scope.includes(branch_id)) return res.status(403).json({ error: 'Forbidden: branch not in your scope' });
+  if (branch_id && !assertBranchAccess(req, res, branch_id)) return;
   conds.push(`s.branch_id IN (${branchIds.map(() => '?').join(',') || 'NULL'})`);
   params.push(...branchIds);
   if (from) { conds.push('s.opened_at >= ?'); params.push(from); }

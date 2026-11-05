@@ -4,8 +4,34 @@ import express from 'express';
 import { db } from '../db.js';
 import { authRequired, requirePermission, audit, assertBranchAccess } from '../auth.js';
 import { id, wrap, badRequest, notFound, branchPrice } from '../lib/helpers.js';
+import { parseSpreadsheet, splitHeader, ImportParseError, MAX_IMPORT_BYTES } from '../lib/spreadsheet.js';
+import { PRODUCT_IMPORT_FIELDS, REQUIRED_IMPORT_KEYS } from '../lib/productImportColumns.js';
+import { suggestMapping, computeImportPlan, runProductImport } from '../lib/productImport.js';
+import { isEdge } from '../edge.js';
 
 const router = express.Router();
+
+/**
+ * Product import writes the catalogue, which on a till is a *replica*: the edge
+ * never pushes catalogue rows upstream (the outbox carries sales only) and the
+ * next `/api/edge/bootstrap` replaces the local products and categories wholesale.
+ * An import performed on a till therefore disappears at the next sync, taking any
+ * stock figures with it.
+ *
+ * The UI hides the Import button in edge mode (see `/api/health`), and this guard
+ * backs that up: an already-open tab, a stale bundle or a hand-made request must
+ * not be able to write data that is guaranteed to be lost.
+ */
+function cloudOnly(req, res, next) {
+  if (isEdge()) {
+    return res.status(409).json({
+      error:
+        'Import produk hanya tersedia di server pusat. Data produk di perangkat kasir ' +
+        'adalah salinan yang akan ditimpa saat sinkronisasi.'
+    });
+  }
+  next();
+}
 
 /* --------------------------- PRODUCT IMAGES --------------------------- */
 
@@ -94,6 +120,174 @@ router.delete('/categories/:id', authRequired, requirePermission('product.manage
   db.prepare('DELETE FROM categories WHERE id = ?').run(c.id);
   audit({ company_id: req.user.company_id, user_id: req.user.sub, action: 'category.delete', entity: 'category', entity_id: c.id, detail: { name: c.name }, ip: req.ip });
   res.json({ ok: true });
+}));
+
+/* --------------------------- PRODUCT IMPORT --------------------------- */
+//
+// Bulk "upload the shop's spreadsheet" flow. Deliberately three endpoints:
+//
+//   GET  /products/import/fields       — column catalogue the mapping UI renders
+//   GET  /products/import/template.csv — a ready-to-fill template
+//   POST /products/import/preview      — parse + map + diff, write nothing
+//   POST /products/import              — the same plan, written in one transaction
+//
+// Preview and apply share `computeImportPlan`, so the numbers the operator
+// approves are the numbers that get written. The file travels as a base64 JSON
+// string (`{ filename, content }`) rather than multipart: the app already has a
+// 5MB JSON parser, and adding multer for one screen is not worth a dependency.
+
+/** Base64 body check that fails loudly instead of letting Buffer.from accept junk. */
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+/** Read `{ filename, content }` from the request body into a Buffer. */
+function readUpload(body) {
+  const filename = String(body?.filename || '').trim();
+  const content = typeof body?.content === 'string' ? body.content.replace(/\s/g, '') : '';
+  if (!content) throw new ImportParseError('File kosong');
+  // Strip a `data:...;base64,` prefix in case a browser sends a data URI.
+  const base64 = content.replace(/^data:[^;]*;base64,/, '');
+  if (!BASE64_RE.test(base64)) throw new ImportParseError('Isi file tidak valid (base64)');
+  const buffer = Buffer.from(base64, 'base64');
+  if (!buffer.length) throw new ImportParseError('File kosong');
+  if (buffer.length > MAX_IMPORT_BYTES) {
+    throw new ImportParseError(`File terlalu besar (maks ${Math.round(MAX_IMPORT_BYTES / 1024 / 1024)}MB)`);
+  }
+  return { filename, buffer };
+}
+
+/**
+ * Parse the upload and resolve its columns.
+ *
+ * The client may send back the mapping it showed the operator; without one it is
+ * re-suggested from the headers here. A supplied mapping is trusted only for its
+ * keys — every index is validated against the real header count, because a stale
+ * mapping from a different file would otherwise read column 9 of a 5-column sheet
+ * and quietly import nothing.
+ */
+function readSheet(body) {
+  const { filename, buffer } = readUpload(body);
+  const { headers, rows } = splitHeader(parseSpreadsheet({ filename, buffer }));
+
+  if (!rows.length) throw new ImportParseError('File tidak berisi baris produk');
+  const width = headers.length;
+
+  // A row wider than the header means an unquoted delimiter inside a value (e.g.
+  // `Ukuran:Large=4000;Ukuran:XL=6000` split in two). Silently truncating it would
+  // shift every later value into the wrong column, so name the line and stop.
+  const overflow = rows.findIndex((row) => row.length > width);
+  if (overflow >= 0) {
+    throw new ImportParseError(
+      `Baris ${overflow + 2} punya ${rows[overflow].length} kolom, judul hanya ${width} — ` +
+        'nilai yang mengandung pemisah harus diapit tanda kutip'
+    );
+  }
+
+  const mapping = {};
+  // An empty object means "suggest for me", not "map nothing": the wizard sends
+  // `{}` on first upload, and treating it as an explicit mapping made every
+  // template download fail with "Kolom wajib belum dipetakan".
+  const requested =
+    body?.mapping && typeof body.mapping === 'object' ? body.mapping : null;
+  const source = requested && Object.keys(requested).length ? requested : suggestMapping(headers);
+  for (const [key, value] of Object.entries(source)) {
+    if (!PRODUCT_IMPORT_FIELDS.some((f) => f.key === key)) continue;
+    const index = Number(value);
+    if (!Number.isInteger(index) || index < 0 || index >= width) continue;
+    mapping[key] = index;
+  }
+
+  const missing = REQUIRED_IMPORT_KEYS.filter((key) => mapping[key] === undefined);
+  if (missing.length) {
+    const labels = missing.map((key) => PRODUCT_IMPORT_FIELDS.find((f) => f.key === key).label);
+    throw new ImportParseError(`Kolom wajib belum dipetakan: ${labels.join(', ')}`);
+  }
+
+  return { headers, rows, mapping };
+}
+
+/** Per-row decisions (`skip`/`update`/`create`) from the preview screen. */
+function readDecisions(body, rowCount) {
+  if (!Array.isArray(body?.existing)) return [];
+  return body.existing.slice(0, rowCount).map((d) =>
+    d && ['skip', 'update', 'create'].includes(d.action) ? { action: d.action } : null
+  );
+}
+
+/** Import options, shared by preview and apply so a preview predicts the apply. */
+function readOptions(req, body) {
+  const branchId = body?.branchId || null;
+  if (branchId) assertBranchAccess(req.user, branchId);
+  return {
+    updateExisting: body?.updateExisting !== false,
+    createMissingCategories: body?.createMissingCategories !== false,
+    branchId
+  };
+}
+
+router.get('/products/import/fields', authRequired, requirePermission('product.manage'), cloudOnly, (req, res) => {
+  res.json({
+    fields: PRODUCT_IMPORT_FIELDS.map(({ key, label, required, kind, example }) => ({ key, label, required, kind, example })),
+    required: REQUIRED_IMPORT_KEYS
+  });
+});
+
+router.get('/products/import/template.csv', authRequired, requirePermission('product.manage'), cloudOnly, (req, res) => {
+  // Semicolons + a BOM so Indonesian Excel opens the file already split into
+  // columns with the right encoding; `parseDelimited` sniffs the delimiter back.
+  const cell = (v) => {
+    const s = String(v ?? '');
+    return /[";\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [
+    PRODUCT_IMPORT_FIELDS.map((f) => cell(f.label)).join(';'),
+    PRODUCT_IMPORT_FIELDS.map((f) => cell(f.example)).join(';')
+  ];
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="template-produk.csv"');
+  res.send('\uFEFF' + lines.join('\r\n') + '\r\n');
+});
+
+router.post('/products/import/preview', authRequired, requirePermission('product.manage'), cloudOnly, wrap((req, res) => {
+  const { headers, rows, mapping } = readSheet(req.body);
+  const options = readOptions(req, req.body);
+  const { plan, summary } = computeImportPlan({
+    companyId: req.user.company_id,
+    rows,
+    mapping,
+    existing: readDecisions(req.body, rows.length),
+    options
+  });
+  res.json({
+    headers,
+    mapping,
+    total: rows.length,
+    ...summary,
+    // `product` bodies are dropped — the browser only needs to render the row.
+    rows: plan.map(({ row, name, action, error, match }) => ({ row, name, action, error, match }))
+  });
+}));
+
+router.post('/products/import', authRequired, requirePermission('product.manage'), cloudOnly, wrap((req, res) => {
+  const { headers, rows, mapping } = readSheet(req.body);
+  const options = readOptions(req, req.body);
+  const result = runProductImport({
+    companyId: req.user.company_id,
+    headers,
+    rows,
+    mapping,
+    existing: readDecisions(req.body, rows.length),
+    options
+  });
+
+  // `aborted` means at least one row was invalid: nothing was written, and the
+  // response carries the same per-row errors a preview would have shown.
+  if (result.aborted) return res.status(400).json(result);
+
+  audit({
+    company_id: req.user.company_id, user_id: req.user.sub, action: 'product.import', entity: 'product', entity_id: null,
+    detail: { created: result.created, updated: result.updated, skipped: result.skipped, total: rows.length }, ip: req.ip
+  });
+  res.status(201).json(result);
 }));
 
 /* ------------------------------ PRODUCTS ------------------------------ */

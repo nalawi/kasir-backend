@@ -17,14 +17,37 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
+import Database from 'better-sqlite3';
 
-import { startPairedWorld, saleBody, cloudStock } from './fixtures.mjs';
+import {
+  startPairedWorld,
+  pairAndBootstrap,
+  seedCloud,
+  saleBody,
+  cloudStock,
+  setCloudStock,
+  setSetting,
+  OWNER,
+} from './fixtures.mjs';
+import { startWorld } from './harness.mjs';
 
 /** Small helper: the count the till's sync badge would show. */
 async function queue(api, token) {
   const res = await api.edge.get('/api/edge/queue', { token });
   assert.equal(res.status, 200, 'queue summary should be readable');
   return res.body;
+}
+
+/**
+ * Read-only handle on a service's replica file.
+ *
+ * Some assertions are about *rows*, not routes — a branch-scoped HTTP read also
+ * has to pass permission checks, which would hide what the test is actually
+ * checking. Same justification (and same WAL safety) as `setSetting` in fixtures.
+ */
+function openReplica(dataDir) {
+  return new Database(path.join(dataDir, 'pos.db'), { readonly: true });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -285,5 +308,454 @@ test('after the fix a requeued conflict is applied exactly once', async (t) => {
   assert.equal(remaining.body.length, 0, 'nothing is left for review');
 
   assert.equal(await cloudStock(api, branchId, teh.id, token), 4, 'stock is deducted exactly once');
+});
+
+/*
+ * 4. First bootstrap on a fresh till, with categorised products.
+ *
+ * Regression: `applyBootstrap` used to insert products before categories, so a
+ * product carrying a `category_id` hit `products.category_id REFERENCES
+ * categories(id)` against a replica that had no categories yet — which is every
+ * fresh till. The whole transaction rolled back and the till could never be
+ * provisioned offline. The other tests missed it because their fixture creates
+ * products with no category.
+ */
+test('bootstrap replicates categorised products onto a till that has never synced', async () => {
+  const world = await startWorld();
+  try {
+    const { api } = world;
+
+    // A cloud company whose catalogue actually uses categories.
+    const cloudReg = await api.cloud.post('/api/auth/register', {
+      body: { company_name: 'Toko Uji', ...OWNER },
+    });
+    assert.ok(cloudReg.status < 300, `cloud register failed: ${JSON.stringify(cloudReg.body)}`);
+    const cloudToken = cloudReg.body.token;
+    const cloudBranchId = cloudReg.body.user.branch_id;
+
+    const cat = await api.cloud.post('/api/categories', {
+      token: cloudToken,
+      body: { name: 'Minuman' },
+    });
+    assert.ok(cat.status < 300, `category create failed: ${JSON.stringify(cat.body)}`);
+
+    const product = await api.cloud.post('/api/products', {
+      token: cloudToken,
+      body: { name: 'Es Kopi Susu', default_price: 22000, category_id: cat.body.id },
+    });
+    assert.ok(product.status < 300, `product create failed: ${JSON.stringify(product.body)}`);
+
+    // Pair and bootstrap a brand-new till (register creates its own company).
+    const reg = await api.edge.post('/api/auth/register', {
+      body: { company_name: 'Toko Uji', ...OWNER },
+    });
+    const adminToken = reg.body.token;
+
+    await api.edge.put('/api/edge/config', {
+      token: adminToken,
+      body: { upstream: world.cloud.url, branch_id: cloudBranchId },
+    });
+    const pair = await api.edge.post('/api/edge/pair', {
+      token: adminToken,
+      body: { email: OWNER.email, password: OWNER.password },
+    });
+    assert.ok(pair.status < 300, `pair failed: ${JSON.stringify(pair.body)}`);
+
+    const boot = await api.edge.post('/api/edge/bootstrap', {
+      token: adminToken,
+      body: { branch_id: cloudBranchId },
+    });
+
+    assert.ok(boot.status < 300, `fresh bootstrap must not fail: ${JSON.stringify(boot.body)}`);
+    assert.equal(boot.body.ok, true);
+    assert.equal(boot.body.categories, 1, 'the category is replicated');
+    assert.equal(boot.body.products, 1, 'the categorised product is replicated');
+
+    // The counts come from the same transaction that hit the FK, so a successful
+    // bootstrap proves categories landed before the products that reference them.
+    assert.equal(boot.body.users, 1, 'the branch roster is replicated even without a PIN');
+    assert.equal(boot.body.pin_users, 0, 'the owner has no PIN, so nobody can unlock yet');
+    assert.equal(boot.body.users_error, null, 'the user pull did not error');
+  } finally {
+    await world.stop();
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/* 5. Branch picker + roster replication (Settings › Diagnostik)               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The setup flow a shop owner actually sees: connect, pick "Cabang Bandung" from
+ * a list, press one button. These are the endpoints that screen calls, so they
+ * are asserted directly rather than through the curl sequence in the README.
+ */
+test('branch picker offers cloud branches and replicates the chosen one', async () => {
+  const world = await startWorld();
+  try {
+    const { api } = world;
+
+    const cloudReg = await api.cloud.post('/api/auth/register', {
+      body: { company_name: 'Toko Dua Cabang', ...OWNER },
+    });
+    assert.ok(cloudReg.status < 300, `cloud register failed: ${JSON.stringify(cloudReg.body)}`);
+    const cloudToken = cloudReg.body.token;
+    const bandung = cloudReg.body.user.branch_id;
+    // `register` names the home branch 'Cabang Utama'; there is no nested branch object.
+    const bandungName = 'Cabang Utama';
+
+    const second = await api.cloud.post('/api/branches', {
+      token: cloudToken,
+      body: { name: 'Cabang Surabaya' },
+    });
+    assert.ok(second.status < 300, `branch create failed: ${JSON.stringify(second.body)}`);
+    const surabaya = second.body.id;
+
+    // A Bandung cashier WITH a PIN: this one must be able to unlock the till.
+    const cashier = await api.cloud.post('/api/users', {
+      token: cloudToken,
+      body: { name: 'Siti Kasir', email: 'siti@toko.test', password: 'rahasia123', role: 'cashier', branch_id: bandung },
+    });
+    assert.ok(cashier.status < 300, `user create failed: ${JSON.stringify(cashier.body)}`);
+    const cashierId = cashier.body.id || cashier.body.user?.id;
+    const setPin = await api.cloud.put(`/api/users/${cashierId}`, {
+      token: cloudToken,
+      body: { pin: '1234' },
+    });
+    assert.ok(setPin.status < 300, `set pin failed: ${JSON.stringify(setPin.body)}`);
+
+    // The owner is in Bandung too but has no PIN: still part of the roster.
+    // Nobody works in Surabaya, so that branch has no staff to replicate.
+
+    const reg = await api.edge.post('/api/auth/register', {
+      body: { company_name: 'Toko Dua Cabang', ...OWNER },
+    });
+    const adminToken = reg.body.token;
+
+    await api.edge.put('/api/edge/config', {
+      token: adminToken,
+      body: { upstream: world.cloud.url },
+    });
+
+    // Before pairing the picker must say so rather than throw: the screen shows step 1.
+    const beforePair = await api.edge.get('/api/edge/cloud-branches', { token: adminToken });
+    assert.equal(beforePair.status, 200);
+    assert.equal(beforePair.body.paired, false, 'an unpaired till is told to connect first');
+    assert.deepEqual(beforePair.body.branches, []);
+
+    const pair = await api.edge.post('/api/edge/pair', {
+      token: adminToken,
+      body: { email: OWNER.email, password: OWNER.password },
+    });
+    assert.ok(pair.status < 300, `pair failed: ${JSON.stringify(pair.body)}`);
+
+    // The dropdown is populated from the cloud, with names a human recognises.
+    const picker = await api.edge.get('/api/edge/cloud-branches', { token: adminToken });
+    assert.equal(picker.status, 200);
+    assert.equal(picker.body.paired, true);
+    const names = picker.body.branches.map((b) => b.name);
+    assert.ok(names.includes('Cabang Surabaya'), `picker should offer every branch, got ${JSON.stringify(names)}`);
+    assert.ok(names.includes(bandungName), `picker should offer the home branch, got ${JSON.stringify(names)}`);
+    assert.equal(picker.body.branches.length, 2, 'only this company branches are offered');
+
+    // Replicate the chosen branch, exactly as the button does.
+    const boot = await api.edge.post('/api/edge/bootstrap', {
+      token: adminToken,
+      body: { branch_id: bandung },
+    });
+    assert.ok(boot.status < 300, `replicate failed: ${JSON.stringify(boot.body)}`);
+    assert.equal(boot.body.users, 2, 'both Bandung staff are replicated, with or without a PIN');
+    assert.equal(boot.body.pin_users, 1, 'exactly one of them can unlock the till');
+
+    // The offline staff picker mirrors that roster.
+    const branches = await api.edge.get('/api/edge/pin-branches', { token: adminToken });
+    assert.equal(branches.status, 200);
+    assert.equal(branches.body.branches.length, 1, 'only the replicated branch exists locally');
+    assert.equal(branches.body.branches[0].name, bandungName);
+    assert.equal(branches.body.branches[0].pin_users, 1);
+
+    const users = await api.edge.get(`/api/edge/pin-users?branch_id=${bandung}`, { token: adminToken });
+    assert.equal(users.status, 200);
+    assert.equal(users.body.length, 2, 'the local registration and the cloud owner collapse into one row');
+    const byName = Object.fromEntries(users.body.map((u) => [u.name, u]));
+    assert.equal(byName['Siti Kasir'].can_unlock, true);
+    assert.equal(byName[OWNER.name].can_unlock, false, 'a PIN-less account is listed but flagged');
+
+    const strayUsers = await api.edge.get(`/api/edge/pin-users?branch_id=${surabaya}`, { token: adminToken });
+    assert.equal(strayUsers.status, 200);
+    assert.deepEqual(strayUsers.body, [], 'an un-replicated branch has no local staff');
+  } finally {
+    await world.stop();
+  }
+});
+
+/**
+ * Switching a till to a second branch must work.
+ *
+ * `branch_stocks.id` is the PRIMARY KEY, so a product-only row id collided as soon
+ * as the same catalog was replicated for another branch: "UNIQUE constraint
+ * failed: branch_stocks.id". The operator picked a branch in the dropdown and got
+ * a raw SQLite error. This asserts the second replication succeeds and that each
+ * branch keeps its own stock row.
+ */
+test('replicating a second branch does not collide on the shared catalog', async () => {
+  const world = await startWorld();
+  try {
+    const { api } = world;
+
+    const cloudReg = await api.cloud.post('/api/auth/register', {
+      body: { company_name: 'Toko Pindah Cabang', ...OWNER },
+    });
+    const cloudToken = cloudReg.body.token;
+    const first = cloudReg.body.user.branch_id;
+
+    const second = await api.cloud.post('/api/branches', {
+      token: cloudToken,
+      body: { name: 'Cabang Kedua' },
+    });
+    assert.ok(second.status < 300, `branch create failed: ${JSON.stringify(second.body)}`);
+    const secondBranch = second.body.id;
+
+    // The same product must exist in both branches, which is what a real catalog
+    // looks like. Stock is set per branch so the two rows are distinguishable.
+    const product = await api.cloud.post('/api/products', {
+      token: cloudToken,
+      body: { name: 'Kopi Susu', sku: 'KS-1', default_price: 18000 },
+    });
+    assert.ok(product.status < 300, `product create failed: ${JSON.stringify(product.body)}`);
+    const productId = product.body.id;
+
+    // Set distinct stock in each branch: the collision was on the stock row id,
+    // so the two rows must end up separate and each carry its own quantity.
+    for (const [branchId, qty] of [[first, 40], [secondBranch, 7]]) {
+      await setCloudStock(api, branchId, productId, qty, cloudToken);
+    }
+
+    const reg = await api.edge.post('/api/auth/register', {
+      body: { company_name: 'Toko Pindah Cabang', ...OWNER },
+    });
+    const adminToken = reg.body.token;
+    await api.edge.put('/api/edge/config', {
+      token: adminToken,
+      body: { upstream: world.cloud.url },
+    });
+    const pair = await api.edge.post('/api/edge/pair', {
+      token: adminToken,
+      body: { email: OWNER.email, password: OWNER.password },
+    });
+    assert.ok(pair.status < 300, `pair failed: ${JSON.stringify(pair.body)}`);
+
+    const bootFirst = await api.edge.post('/api/edge/bootstrap', {
+      token: adminToken,
+      body: { branch_id: first },
+    });
+    assert.ok(bootFirst.status < 300, `first replicate failed: ${JSON.stringify(bootFirst.body)}`);
+    assert.equal(bootFirst.body.products, 1);
+
+    // This bootstrap re-tenanted the till's own admin row, so the token above is
+    // now stale. Every later call must use the replacement the service returned.
+    const sessionToken = bootFirst.body.token || adminToken;
+
+    // The regression: this used to answer 500 "UNIQUE constraint failed:
+    // branch_stocks.id" because the row id was built from the product alone.
+    const bootSecond = await api.edge.post('/api/edge/bootstrap', {
+      token: sessionToken,
+      body: { branch_id: secondBranch },
+    });
+    assert.ok(
+      bootSecond.status < 300,
+      `switching branch must not collide: ${JSON.stringify(bootSecond.body)}`
+    );
+    assert.equal(bootSecond.body.products, 1, 'the same catalog lands on the new branch');
+
+    // Re-running the first branch again is still fine (idempotent, one stock row
+    // each). This also moves the till's active branch back to `first`, which is
+    // what the service is meant to do: bootstrap adopts the branch it just pulled.
+    const bootAgain = await api.edge.post('/api/edge/bootstrap', {
+      token: sessionToken,
+      body: { branch_id: first },
+    });
+    assert.ok(bootAgain.status < 300, `re-replicate failed: ${JSON.stringify(bootAgain.body)}`);
+
+    const infoAfterFirst = await api.edge.get('/api/edge/info', { token: sessionToken });
+    assert.equal(infoAfterFirst.body.branch_id, first, 'bootstrap adopts the branch it pulled');
+
+    // Switch back to the second branch, the way the dropdown does, and check each
+    // branch kept its OWN stock row. The old bug either failed outright or wrote
+    // one shared row keyed on the product alone.
+    const bootSecondAgain = await api.edge.post('/api/edge/bootstrap', {
+      token: sessionToken,
+      body: { branch_id: secondBranch },
+    });
+    assert.ok(bootSecondAgain.status < 300, `switch back failed: ${JSON.stringify(bootSecondAgain.body)}`);
+
+    const info = await api.edge.get('/api/edge/info', { token: sessionToken });
+    assert.equal(info.body.branch_id, secondBranch, 'the till stays on the chosen branch');
+
+    // Read the till's own replica file. The branch-scoped HTTP route answers 403
+    // here because the till registered its OWN company locally, so the caller is
+    // not in scope for a cloud branch id — that is a permission question, not the
+    // collision this test is about. What the fix changed is the replicated rows.
+    const replica = openReplica(world.edge.dataDir);
+    try {
+      const stockRows = replica
+        .prepare('SELECT id, branch_id, product_id, quantity FROM branch_stocks WHERE product_id = ? ORDER BY branch_id')
+        .all(productId);
+      assert.equal(stockRows.length, 2, 'one stock row per branch, not one shared row');
+      const byBranch = new Map(stockRows.map((r) => [r.branch_id, r]));
+      assert.equal(Number(byBranch.get(first).quantity), 40, 'the home branch keeps its own quantity');
+      assert.equal(Number(byBranch.get(secondBranch).quantity), 7, 'the new branch keeps its own quantity');
+      assert.notEqual(byBranch.get(first).id, byBranch.get(secondBranch).id, 'row ids are per branch');
+
+      const priceRows = replica
+        .prepare('SELECT id, branch_id FROM branch_products WHERE product_id = ?')
+        .all(productId);
+      assert.equal(priceRows.length, 2, 'price overrides are per branch too');
+    } finally {
+      replica.close();
+    }
+  } finally {
+    await world.stop();
+  }
+});
+
+/**
+ * A PIN-less user is a different problem from a wrong PIN, and the cashier must
+ * be told which one it is — retrying can never fix a missing PIN.
+ */
+test('offline unlock explains a missing PIN instead of reporting a wrong one', async () => {
+  const world = await startWorld();
+  try {
+    const { api } = world;
+
+    const cloudReg = await api.cloud.post('/api/auth/register', {
+      body: { company_name: 'Toko Tanpa PIN', ...OWNER },
+    });
+    const branchId = cloudReg.body.user.branch_id;
+
+    const reg = await api.edge.post('/api/auth/register', {
+      body: { company_name: 'Toko Tanpa PIN', ...OWNER },
+    });
+    const adminToken = reg.body.token;
+    await api.edge.put('/api/edge/config', { token: adminToken, body: { upstream: world.cloud.url } });
+    await api.edge.post('/api/edge/pair', {
+      token: adminToken,
+      body: { email: OWNER.email, password: OWNER.password },
+    });
+    const boot = await api.edge.post('/api/edge/bootstrap', { token: adminToken, body: { branch_id: branchId } });
+    // Bootstrap re-tenants this till's admin row, so the token above is spent.
+    const sessionToken = boot.body.token || adminToken;
+
+    const users = await api.edge.get(`/api/edge/pin-users?branch_id=${branchId}`, { token: sessionToken });
+    const ownerRow = users.body.find((u) => u.name === OWNER.name);
+    assert.ok(ownerRow, 'the owner is replicated despite having no PIN');
+
+    const unlock = await api.edge.post('/api/edge/unlock', {
+      body: { user_id: ownerRow.id, pin: '1234' },
+    });
+    assert.equal(unlock.status, 409, 'a missing PIN is not a 401 auth failure');
+    assert.equal(unlock.body.no_pin, true);
+    assert.match(unlock.body.error, /belum mengatur PIN/i);
+  } finally {
+    await world.stop();
+  }
+});
+
+
+/* -------------------------------------------------------------------------- */
+/* A stale device token must be reported as "pair again", not "no internet"    */
+/* -------------------------------------------------------------------------- */
+
+test('a stale device token is reported as a re-pair, not a connection failure', async (t) => {
+  // `startPairedWorld` spreads the pairing result over `edge`, hiding the server
+  // object that carries `dataDir`. Build the pair step by step so both handles
+  // stay available.
+  const world = await startWorld();
+  t.after(() => world.stop());
+  const seeded = await seedCloud(world.api);
+  const edge = await pairAndBootstrap(world, seeded);
+
+  // Simulate what a reseeded cloud looks like from the till's side: the stored
+  // `edge_device_token` still parses, but it is no longer one the cloud will
+  // honour. This is not hypothetical — a till installed against an earlier
+  // cloud DB showed exactly this, and the panel told the operator to check
+  // their internet, which can never fix it.
+  const stale =
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9' +
+    '.eyJzdWIiOiJ1c2VyLXRoYXQtbm8tbG9uZ2VyLWV4aXN0cyIsImNvbXBhbnlfaWQiOiJ4Iiwicm9sZSI6InN1cGVyX2FkbWluIn0' +
+    '.c2lnbmF0dXJlLW5vdC12ZXJpZmllZC1ieS10aGUtY2xvdWQ';
+  setSetting(world.edge.dataDir, 'edge_device_token', stale);
+
+  const res = await world.api.edge.get('/api/edge/cloud-branches', { token: edge.adminToken });
+
+  assert.equal(res.status, 200, 'the endpoint must still answer, with a reason');
+  assert.equal(res.body.paired, true);
+  assert.deepEqual(res.body.branches, [], 'a rejected token yields no branches');
+
+  // The cloud rejects the *signature* first, so the message varies between
+  // "invalid or expired token" and "user inactive or not found". Both mean the
+  // same thing to the operator, and neither is a network fault.
+  const reason = String(res.body.reason || '');
+  assert.ok(reason.length > 0, 'a reason must be given');
+  assert.ok(/hubungkan ulang|kedaluwarsa/i.test(reason), `expected a re-pair message, got: ${reason}`);
+  assert.ok(
+    !/koneksi internet/i.test(reason),
+    `a rejected token must not be blamed on the internet, got: ${reason}`,
+  );
+});
+
+/**
+ * A fresh till must be able to be pointed at a cloud that is NOT on loopback.
+ *
+ * The reported symptom was the inverse of what the code assumed: the operator
+ * filled in "Alamat Server" on a brand-new install, the form said it worked, and
+ * the till still talked to `127.0.0.1` — because that field writes
+ * `pos_server_url`, which the desktop app overwrites with its own embedded
+ * service's loopback URL on every boot. The value that matters is the *upstream*,
+ * and nothing in the UI was writing it.
+ *
+ * This covers the half the frontend cannot: the service must accept a non-loopback
+ * address, persist it, report it back, and actually use it when pairing.
+ */
+test('the service accepts and uses a non-loopback upstream', async (t) => {
+  const world = await startWorld();
+  t.after(() => world.stop());
+  const seeded = await seedCloud(world.api);
+
+  const reg = await world.api.edge.post('/api/auth/register', {
+    body: { company_name: 'Toko Server Pusat', ...OWNER },
+  });
+  const adminToken = reg.body.token;
+
+  // A cloud reachable over a real socket, which is the normal deployment: the
+  // till is on a shop counter, the cloud is somewhere else entirely.
+  const remote = world.cloud.url;
+  assert.match(remote, /^http:\/\/127\.0\.0\.1:\d+$/, 'the harness cloud has a real URL');
+
+  const cfg = await world.api.edge.put('/api/edge/config', {
+    token: adminToken,
+    body: { upstream: remote },
+  });
+  assert.ok(cfg.status < 300, `config failed: ${JSON.stringify(cfg.body)}`);
+  assert.equal(cfg.body.upstream, remote, 'the service must echo the address it stored');
+
+  // It must be persisted, not merely held in memory — the reported bug was a value
+  // that looked saved in the UI but was gone (back to loopback) after a restart.
+  const info = await world.api.edge.get('/api/edge/info');
+  assert.equal(info.body.upstream, remote, 'the address must be persisted, not just held in memory');
+
+  // And pairing goes to *that* address rather than assuming localhost.
+  const pair = await world.api.edge.post('/api/edge/pair', {
+    token: adminToken,
+    body: { email: OWNER.email, password: OWNER.password },
+  });
+  assert.ok(pair.status < 300, `pair against the remote upstream failed: ${JSON.stringify(pair.body)}`);
+
+  const boot = await world.api.edge.post('/api/edge/bootstrap', {
+    token: adminToken,
+    body: { branch_id: seeded.branchId },
+  });
+  assert.ok(boot.status < 300, `bootstrap failed: ${JSON.stringify(boot.body)}`);
+  assert.ok(boot.body.products > 0, 'products should have replicated from the configured upstream');
 });
 

@@ -88,6 +88,15 @@ export async function pairAndBootstrap(world, seeded) {
   });
   if (boot.status >= 300) throw new Error(`bootstrap failed: ${JSON.stringify(boot.body)}`);
 
+  // Bootstrap can re-point this till's own admin row at the cloud's company (the
+  // till is registered locally first, under the same email). The token minted at
+  // registration then names the previous company and the service rejects it as a
+  // 'Tenant mismatch', so the service hands back a replacement — exactly as the
+  // app does. Deliberately no fallback: if the service stops issuing one, the
+  // tests must fail instead of quietly carrying on with a spent token.
+  const adminToken = boot.body.token;
+  if (!adminToken) throw new Error('bootstrap did not return a replacement token');
+
   // After bootstrap the till's replica holds the CLOUD's branch id and users, and
   // a sale must be entered as a real till operator. Selling as the till's own
   // bootstrap-admin would be scoped to the local branch id it generated at
@@ -99,15 +108,31 @@ export async function pairAndBootstrap(world, seeded) {
   });
   if (unlock.status >= 300) throw new Error(`unlock failed: ${JSON.stringify(unlock.body)}`);
 
-  return { edgeToken: unlock.body.token, adminToken: edgeAdmin, pair: pair.body, boot: boot.body, unlock: unlock.body };
+  return {
+    edgeToken: unlock.body.token,
+    adminToken,
+    // The bearer minted at local registration, before pairing. Bootstrap is
+    // supposed to invalidate it, so tests need it to prove that happened.
+    registeredToken: edgeAdmin,
+    pair: pair.body,
+    boot: boot.body,
+    unlock: unlock.body,
+  };
 }
 
-/** A paired world: cloud seeded, till paired and bootstrapped. */
+/**
+ * A paired world: cloud seeded, till paired and bootstrapped.
+ *
+ * `edge` is the token bundle from `pairAndBootstrap`, the shape nearly every test
+ * wants. The server handles keep their original names under `servers`, because
+ * the spread below would otherwise bury `url`/`stop` under the bundle — and a test
+ * that talks HTTP to the till needs the URL.
+ */
 export async function startPairedWorld() {
   const world = await startWorld();
   const seeded = await seedCloud(world.api);
   const edge = await pairAndBootstrap(world, seeded);
-  return { ...world, seeded, edge };
+  return { ...world, seeded, edge, servers: { cloud: world.cloud, edge: world.edge } };
 }
 
 /** Build a checkout body for one product line. */

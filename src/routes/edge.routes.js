@@ -3,6 +3,7 @@
 //
 //   GET  /api/edge/health      liveness + queue depth (polled by the Tauri supervisor)
 //   GET  /api/edge/info        which mode/upstream/device this service runs as
+//   GET  /api/edge/cloud-branches  the cloud's branch list, for the setup picker
 //   PUT  /api/edge/config      set the cloud address this till should sync to
 //   POST /api/edge/pair        log in to the cloud once, keep its token for sync
 //   POST /api/edge/bootstrap   pull catalog + stock + PIN users into the replica
@@ -69,11 +70,23 @@ async function upstreamFetch(path, { method = 'GET', token, body, anonymous = fa
   return data;
 }
 
-/** A transport failure means "no internet", which needs a different message to a refusal. */
+/**
+ * A transport failure means "no internet", which needs a different message to a
+ * refusal.
+ *
+ * A cloud-side `401` is singled out because it is the one refusal that looks
+ * like an internet problem but is not: the stored `edge_device_token` is
+ * rejected because the paired admin no longer exists (the cloud DB was
+ * reseeded) or the token expired. Retrying will never fix it — the till has to
+ * pair again — so saying so beats telling the operator to check their Wi-Fi.
+ */
 function transportMessage(e) {
   const raw = String(e?.message || e);
   if (/fetch failed|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|network|socket/i.test(raw)) {
     return 'Tidak dapat menghubungi server pusat. Periksa koneksi internet.';
+  }
+  if (/user inactive or not found|invalid or expired token|tenant mismatch/i.test(raw)) {
+    return 'Kredensial perangkat ditolak server pusat (akun tidak ada lagi atau sudah kedaluwarsa). Hubungkan ulang perangkat ini.';
   }
   return raw;
 }
@@ -162,6 +175,44 @@ router.post('/edge/drain', authRequired, wrap(async (req, res) => {
 }));
 
 /**
+ * GET /edge/cloud-branches
+ *
+ * The cloud's branch list, so the setup screen can offer a dropdown instead of
+ * asking someone to paste a branch id. Reads through the paired token: whoever
+ * provisioned this till can only see the branches they may already reach.
+ *
+ * Requires pairing, because that is what provides the credential. Callers get a
+ * `paired: false` flag rather than an error so the UI can prompt for step one
+ * instead of showing a raw failure.
+ */
+router.get('/edge/cloud-branches', authRequired, wrap(async (req, res) => {
+  if (!upstreamUrl()) {
+    return res.json({ paired: false, upstream: null, branches: [], reason: 'Server pusat belum diatur' });
+  }
+  if (!setting('edge_device_token')) {
+    return res.json({ paired: false, upstream: upstreamUrl(), branches: [], reason: 'Perangkat belum terhubung' });
+  }
+  try {
+    const rows = await upstreamFetch('/api/branches');
+    const list = Array.isArray(rows) ? rows : [];
+    res.json({
+      paired: true,
+      upstream: upstreamUrl(),
+      current_branch_id: setting('edge_branch_id'),
+      paired_user: setting('edge_device_user'),
+      branches: list.map((b) => ({
+        id: b.id,
+        name: b.name,
+        address: b.address ?? null,
+        user_count: b.user_count ?? 0,
+      })),
+    });
+  } catch (e) {
+    res.json({ paired: true, upstream: upstreamUrl(), branches: [], reason: transportMessage(e) });
+  }
+}));
+
+/**
  * POST /edge/pair  { email, password }   (runs on the TILL)
  *
  * The one-time online step that makes offline mode work.
@@ -238,9 +289,26 @@ router.post('/edge/bootstrap', authRequired, wrap(async (req, res) => {
       usersError = transportMessage(e);
     }
 
+    // Remember which company the caller's token was signed for *before* the
+    // bootstrap runs. `pair` has already stored the cloud's company in
+    // `edge_company_id`, so that setting cannot tell us whether the caller's own
+    // bearer went stale — only the caller's token can.
+    const callerCompany = req.user.company_id;
+
     const summary = applyBootstrap({ snapshot, users, branchId });
     setSetting('edge_branch_id', branchId);
-    res.json({ ok: true, ...summary, users_error: usersError });
+
+    // Bootstrap can re-point the caller's own row at the cloud's company (see
+    // applyBootstrap: leaving `company_id` stale is what made every page 403). The
+    // bearer that arrived here was signed with the *old* company, so authRequired
+    // compares it against the row on the next request and rejects it as a 'Tenant
+    // mismatch' — the till would be locked out of its own service mid-setup. Hand
+    // back a token signed for the row as it is now, so the caller just swaps it in.
+    let token;
+    const me = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.sub);
+    if (me && me.company_id !== callerCompany) token = signToken(me);
+
+    res.json({ ok: true, ...summary, users_error: usersError, token });
   } catch (e) {
     res.status(502).json({ error: transportMessage(e) });
   }
@@ -293,6 +361,15 @@ router.post('/edge/unlock', wrap((req, res) => {
   const ok = Boolean(user && user.is_active && verifyPinHash(pin, user.pin_hash));
   db.prepare('INSERT INTO edge_login_attempts (user_id, success) VALUES (?, ?)').run(user_id, ok ? 1 : 0);
   if (!ok) {
+    // A user replicated without a PIN is a distinct failure from a wrong PIN:
+    // no amount of retrying helps, they have to set a PIN in the cloud. Say so
+    // rather than charging their lockout counter for an impossible attempt.
+    if (user && user.is_active && !user.pin_hash) {
+      return res.status(409).json({
+        error: 'Pengguna ini belum mengatur PIN. Atur PIN di server pusat, lalu sinkronkan ulang perangkat ini.',
+        no_pin: true,
+      });
+    }
     return res.status(401).json({
       error: user ? 'PIN salah' : 'Pengguna ini belum tersedia di perangkat ini. Login online sekali dulu.',
       remaining: Math.max(0, MAX_FAILS - recentFails(user_id)),
@@ -324,13 +401,22 @@ router.post('/edge/unlock', wrap((req, res) => {
  *
  * Offline copies of the public PIN-login screens. They read the replicated
  * database, so the branch picker and cashier list render with no network.
+ *
+ * The branch list includes any branch that has staff, not just branches where
+ * somebody holds a PIN: a branch whose staff have not set PINs yet still has to
+ * appear, so the operator can see it and fix the PIN in the cloud instead of
+ * concluding the replication failed.
  */
 router.get('/edge/pin-branches', wrap((req, res) => {
   const rows = db
     .prepare(
-      `SELECT DISTINCT b.id, b.name FROM branches b
+      `SELECT b.id, b.name,
+              (SELECT COUNT(*) FROM users u
+                WHERE u.branch_id = b.id AND u.is_active = 1 AND u.pin_hash IS NOT NULL) AS pin_users
+       FROM branches b
        JOIN users u ON u.branch_id = b.id
-       WHERE b.is_active = 1 AND u.is_active = 1 AND u.pin_hash IS NOT NULL
+       WHERE b.is_active = 1 AND u.is_active = 1
+       GROUP BY b.id, b.name
        ORDER BY b.name`
     )
     .all();
@@ -342,11 +428,12 @@ router.get('/edge/pin-users', wrap((req, res) => {
   if (!branchId) return badRequest(res, 'branch_id required');
   const rows = db
     .prepare(
-      `SELECT id, name, role, avatar_url FROM users
-       WHERE branch_id = ? AND is_active = 1 AND pin_hash IS NOT NULL ORDER BY name`
+      `SELECT id, name, role, avatar_url, (pin_hash IS NOT NULL) AS can_unlock
+       FROM users
+       WHERE branch_id = ? AND is_active = 1 ORDER BY name`
     )
     .all(branchId);
-  res.json(rows);
+  res.json(rows.map((r) => ({ ...r, can_unlock: Boolean(r.can_unlock) })));
 }));
 
 export default router;
