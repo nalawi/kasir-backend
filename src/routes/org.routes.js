@@ -117,14 +117,56 @@ router.delete('/users/:id', authRequired, requirePermission('user.manage'), wrap
 
 /* -------------------------------- ROLES -------------------------------- */
 
+/**
+ * How many users hold each role, keyed by role name.
+ *
+ * Roles are referenced by name from `users.role`, so the count has to use the
+ * same predicate the DELETE guard uses (every user, active or not). Counting
+ * only active users would show "0 pengguna" for a role the server then refuses
+ * to delete with "masih dipakai oleh 1 pengguna".
+ */
+function roleUsage(companyId) {
+  const rows = db
+    .prepare('SELECT role, COUNT(*) AS n FROM users WHERE company_id = ? GROUP BY role')
+    .all(companyId);
+  return new Map(rows.map((r) => [r.role, r.n]));
+}
+
+/**
+ * Permissions the caller is allowed to hand out.
+ *
+ * `role.manage` must not become a path to privilege escalation: without this a
+ * branch manager could create a role holding `company.manage` and assign it to
+ * themselves. The Super Admin owns the company, so they are exempt.
+ *
+ * Returns `{ perms }` or `{ denied }` — unknown keys are dropped first, so the
+ * caller only ever rejects permissions that actually exist.
+ */
+function grantablePermissions(req, requested) {
+  const perms = (Array.isArray(requested) ? requested : []).filter((p) => ALL_PERMISSIONS.includes(p));
+  if (req.user.role === 'super_admin') return { perms };
+  const own = new Set(getPermissions(req.user.role, req.user.company_id));
+  const denied = perms.filter((p) => !own.has(p));
+  return denied.length ? { denied } : { perms };
+}
+
 router.get('/roles/catalog', authRequired, (req, res) => res.json(catalog()));
 
 router.get('/roles', authRequired, requirePermission('role.manage', 'user.manage'), (req, res) => {
+  const usage = roleUsage(req.user.company_id);
   const custom = db
     .prepare('SELECT * FROM roles WHERE company_id = ? ORDER BY name')
     .all(req.user.company_id)
-    .map((r) => ({ ...r, permissions: JSON.parse(r.permissions || '[]'), is_system: !!r.is_system }));
-  res.json({ builtin: catalog().builtin_roles, custom });
+    .map((r) => ({
+      ...r,
+      permissions: JSON.parse(r.permissions || '[]'),
+      is_system: !!r.is_system,
+      usage_count: usage.get(r.name) || 0,
+    }));
+  res.json({
+    builtin: catalog().builtin_roles.map((r) => ({ ...r, usage_count: usage.get(r.key) || 0 })),
+    custom,
+  });
 });
 
 router.post('/roles', authRequired, requirePermission('role.manage'), wrap((req, res) => {
@@ -133,7 +175,10 @@ router.post('/roles', authRequired, requirePermission('role.manage'), wrap((req,
   if (ROLE_PERMISSIONS[name]) return badRequest(res, 'Nama role bentrok dengan role sistem');
   if (db.prepare('SELECT id FROM roles WHERE company_id = ? AND name = ?').get(req.user.company_id, name))
     return res.status(409).json({ error: 'Role sudah ada' });
-  const perms = (Array.isArray(permissions) ? permissions : []).filter((p) => ALL_PERMISSIONS.includes(p));
+  const granted = grantablePermissions(req, permissions);
+  if (granted.denied)
+    return res.status(403).json({ error: `Tidak boleh memberikan hak akses yang tidak Anda miliki: ${granted.denied.join(', ')}` });
+  const perms = granted.perms;
   const rid = id();
   db.prepare('INSERT INTO roles (id, company_id, name, permissions, is_system, description) VALUES (?, ?, ?, ?, 0, ?)')
     .run(rid, req.user.company_id, name, JSON.stringify(perms), description || null);
@@ -144,7 +189,10 @@ router.post('/roles', authRequired, requirePermission('role.manage'), wrap((req,
 router.put('/roles/:id', authRequired, requirePermission('role.manage'), wrap((req, res) => {
   const r = db.prepare('SELECT * FROM roles WHERE id = ? AND company_id = ?').get(req.params.id, req.user.company_id);
   if (!r) return notFound(res);
-  const perms = (Array.isArray(req.body.permissions) ? req.body.permissions : []).filter((p) => ALL_PERMISSIONS.includes(p));
+  const granted = grantablePermissions(req, req.body.permissions);
+  if (granted.denied)
+    return res.status(403).json({ error: `Tidak boleh memberikan hak akses yang tidak Anda miliki: ${granted.denied.join(', ')}` });
+  const perms = granted.perms;
   db.prepare("UPDATE roles SET permissions = ?, description = COALESCE(?, description), updated_at = datetime('now') WHERE id = ?")
     .run(JSON.stringify(perms), req.body.description || null, r.id);
   audit({ company_id: req.user.company_id, user_id: req.user.sub, action: 'role.update', entity: 'role', entity_id: r.id, detail: { perms }, ip: req.ip });
