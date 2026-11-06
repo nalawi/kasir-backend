@@ -77,6 +77,47 @@ and crack it offline. Pairing decides whose cloud token the till reuses, which i
 the same kind of authority, so the two are gated together: whoever may pair may
 also provision offline logins.
 
+## Registering the till happens exactly once
+
+The app's login page carries a "Daftar Perusahaan" tab, and the till answers the
+same `POST /api/auth/register` route the cloud does. That route creates a company,
+a `Cabang Utama` and a `super_admin` — which on a till means an account with every
+permission over the local service, including `device.manage`. Since the till's
+`companies` table is a *replica* of the cloud's, a second registration is not a
+second tenant: it is a phantom row that holds the paired cloud token, the drain
+queue and the PIN list, and no bootstrap ever removes it.
+
+So on a till the route is open exactly while `companies` is empty, and refuses
+afterwards with `409`. `GET /api/health` reports the same decision as
+`features.register`, and the login page hides the tab when it is false. Hiding the
+tab is only a courtesy, though: the refusal lives in the route, because a hidden
+button protects nothing against a request sent by hand.
+
+The first registration is still required, because it mints the only session that
+may call `/api/edge/pair`. In practice: fresh till → register once → pair →
+bootstrap → the tab disappears for good. Additional staff arrive from the cloud
+via the normal sync, never from the till's login page.
+
+**Changing the cloud address drops the pairing.** `PUT /api/edge/config` requires
+`device.manage` when it actually changes the upstream, and clears
+`edge_device_token`, `edge_device_user` and `edge_paired_at`, because that token was
+minted by the previous host and `upstreamFetch` would otherwise present it to
+whatever address was typed in. Re-sending the address the till already has stays
+open to any session — the app does that on every login and on branch switch. After
+a real change, pair again from Pengaturan → Server.
+
+**A till that already has a second company** is not repaired by either rule: the
+phantom row and its `super_admin` were written before the check existed, and they
+keep `device.manage` over the local service. `authRequired` re-reads the user row on
+every request, so deactivating the account is immediate (no need to rotate keys):
+
+```sql
+-- inspect first: a healthy till holds exactly one company
+SELECT c.name, u.email, u.role FROM companies c LEFT JOIN users u ON u.company_id = c.id;
+-- then disable the phantom tenant's accounts (its data stays, nothing cascades)
+UPDATE users SET is_active = 0 WHERE company_id = '<phantom company id>';
+```
+
 ## Prerequisites on the till
 
 * Node runtime available on `PATH` (or bundled next to the app).

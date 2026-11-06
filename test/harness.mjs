@@ -64,7 +64,7 @@ async function waitForHealth(url) {
 /**
  * Spawn one server on its own port and data directory, and resolve once healthy.
  */
-async function startServer({ mode, logPrefix }) {
+async function startServer({ mode, logPrefix, env }) {
   const dataDir = tempDir();
   const port = await freePort();
   const child = spawn(process.execPath, [SERVER], {
@@ -78,6 +78,9 @@ async function startServer({ mode, logPrefix }) {
       // that would silently change behaviour under test.
       NODE_ENV: 'production',
       JWT_SECRET: 'test-secret',
+      // Per-server overrides (e.g. `ALLOW_SIGNUP=0`), applied last on purpose: a
+      // test that exercises a switch must win over the inherited environment.
+      ...(env || {}),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -121,14 +124,23 @@ async function startServer({ mode, logPrefix }) {
 }
 
 /**
+ * Start one server only. Exported for tests about a single role's own surface
+ * (static hosting, the CLI's database) where spinning up a paired world would be
+ * noise — and where `startWorld`'s edge process must not run at all.
+ */
+export async function startSingle({ mode = 'cloud', env } = {}) {
+  return startServer({ mode, logPrefix: mode, env });
+}
+
+/**
  * Start a paired world: a cloud with a fresh company, and an edge till pointed
  * at it. The till is NOT paired or bootstrapped here — tests that care about
  * those steps call the endpoints themselves.
  */
-export async function startWorld() {
+export async function startWorld({ cloudEnv, edgeEnv } = {}) {
   const [cloud, edge] = await Promise.all([
-    startServer({ mode: 'cloud', logPrefix: 'cloud' }),
-    startServer({ mode: 'edge', logPrefix: 'edge' }),
+    startServer({ mode: 'cloud', logPrefix: 'cloud', env: cloudEnv }),
+    startServer({ mode: 'edge', logPrefix: 'edge', env: edgeEnv }),
   ]);
 
   const stopAll = async () => {

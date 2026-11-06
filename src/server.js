@@ -7,7 +7,7 @@ import { initSchema, db, DATA_DIR } from './db.js';
 import { isEdge, EDGE_HOST, edgeCorsOptions, localSecret } from './edge.js';
 import { startUpstreamWorker } from './lib/edgeOutbox.js';
 
-import authRoutes from './routes/auth.routes.js';
+import authRoutes, { registrationState } from './routes/auth.routes.js';
 import orgRoutes from './routes/org.routes.js';
 import catalogRoutes from './routes/catalog.routes.js';
 import stockRoutes from './routes/stock.routes.js';
@@ -76,6 +76,15 @@ app.get('/api/health', (req, res) =>
       // replica: it is never pushed upstream and is replaced wholesale on the
       // next bootstrap, so the import is offered on the cloud only.
       productImport: !EDGE,
+      // Whether `POST /api/auth/register` still accepts a new company. On a till
+      // that is true exactly once — during first-run setup, while the replica has
+      // no company yet (see `registrationState` in auth.routes) — because a second
+      // company row would be a phantom tenant with `super_admin` over the local
+      // service. On the cloud it is the operator's `ALLOW_SIGNUP` switch. The login
+      // page hides the Register tab when this is false, and the route refuses
+      // regardless; the read is one indexed row on the till, and the supervisor's
+      // hot probe is `/api/edge/health`, which does not touch it.
+      register: registrationState().open,
     },
     time: new Date().toISOString(),
   })
@@ -110,7 +119,44 @@ app.use(
 // cloud deployment exposes exactly the same API it did before.
 if (EDGE) app.use('/api', edgeRoutes);
 
+/* ------------------------------ WEB APP ------------------------------ */
+// A web deployment gets one process and one port: the built SPA is served from
+// here, so the browser's origin is the API and CORS never applies. Nothing is
+// mounted when `WEB_ROOT` is unset, which is every till and every API-only
+// install — the surface they expose is unchanged.
+//
+// Deliberately after the API routers: `/api/*` must keep answering JSON for
+// unknown paths (the 404 below) instead of handing back index.html.
+if (!EDGE && process.env.WEB_ROOT) {
+  const WEB_ROOT = path.resolve(process.env.WEB_ROOT);
+  const indexFile = path.join(WEB_ROOT, 'index.html');
+  if (fs.existsSync(indexFile)) {
+    app.use(
+      express.static(WEB_ROOT, {
+        index: false, // the fallback below sets the cache headers we want
+        setHeaders: (res, filePath) => {
+          // Vite emits content-hashed asset names, so they can be cached hard;
+          // index.html must not be, or an upgrade leaves clients on old JS.
+          if (/\/assets\//.test(filePath)) res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        },
+      })
+    );
+    // Client-side routes (/transactions/:id, /products, ...) are not files on
+    // disk. Any GET that is not API or uploads returns the shell and lets the
+    // router resolve it.
+    app.get('*', (req, res, next) => {
+      if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) return next();
+      res.setHeader('Cache-Control', 'no-cache');
+      res.sendFile(indexFile);
+    });
+    if (process.env.NODE_ENV !== 'test') console.log(`POS web app served from ${WEB_ROOT}`);
+  } else if (process.env.NODE_ENV !== 'test') {
+    console.warn(`[web] WEB_ROOT is set to ${WEB_ROOT} but it has no index.html — serving the API only`);
+  }
+}
+
 /* ------------------------------ 404 + ERRORS ------------------------------ */
+
 app.use('/api', (req, res) => res.status(404).json({ error: `Endpoint not found: ${req.method} ${req.originalUrl}` }));
 
 // eslint-disable-next-line no-unused-vars

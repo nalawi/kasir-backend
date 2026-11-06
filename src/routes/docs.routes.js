@@ -12,7 +12,7 @@ const idParam = (name = 'id') => ({ name, in: 'path', required: true, schema: { 
 // [path, method, tag, summary, responseSchema?, pathParams?]
 const ROUTES = [
   ['/health', 'get', 'Auth', 'Health check'],
-  ['/auth/register', 'post', 'Auth', 'Registrasi perusahaan + cabang + super admin'],
+  ['/auth/register', 'post', 'Auth', 'Registrasi perusahaan + cabang + super admin (edge: hanya sekali saat penyiapan)'],
   ['/auth/login', 'post', 'Auth', 'Login email + password (proteksi brute force)'],
   ['/auth/pin-login', 'post', 'Auth', 'Login cepat dengan PIN kasir'],
   ['/auth/pin-users', 'get', 'Auth', 'Daftar kasir untuk layar PIN', arr],
@@ -114,7 +114,7 @@ const REPORT_SYNC_ROUTES = [
   ['/reports/export/products.csv', 'get', 'Laporan', 'Export penjualan produk (CSV)', 'csv'],
   ['/reports/export/stock.csv', 'get', 'Laporan', 'Export stok (CSV)', 'csv'],
   ['/reports/export/shifts.csv', 'get', 'Laporan', 'Export shift (CSV)', 'csv'],
-  ['/sync/bootstrap', 'get', 'Sinkronisasi', 'Snapshot offline (produk, stok, setting)'],
+  ['/sync/bootstrap', 'get', 'Sinkronisasi', 'Snapshot offline (produk, varian, stok, role kustom, setting)'],
   ['/sync/batch', 'post', 'Sinkronisasi', 'Kirim batch transaksi offline'],
   ['/sync/status', 'get', 'Sinkronisasi', 'Status antrean sinkronisasi'],
   ['/sync/conflicts', 'get', 'Sinkronisasi', 'Daftar konflik sinkronisasi', arr],

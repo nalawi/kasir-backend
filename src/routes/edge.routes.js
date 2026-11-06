@@ -5,6 +5,7 @@
 //   GET  /api/edge/info        which mode/upstream/device this service runs as
 //   GET  /api/edge/cloud-branches  the cloud's branch list, for the setup picker
 //   PUT  /api/edge/config      set the cloud address this till should sync to
+//                              (changing it needs device.manage and drops the pairing)
 //   POST /api/edge/pair        log in to the cloud once, keep its token for sync
 //   POST /api/edge/bootstrap   pull catalog + stock + PIN users into the replica
 //   GET  /api/edge/queue       outbox summary (sync badge)
@@ -37,6 +38,9 @@ const setSetting = (key, value) =>
 export function upstreamUrl() {
   return setting('edge_upstream_url') || process.env.EDGE_UPSTREAM_URL || null;
 }
+
+/** Address as stored/compared: no trailing slash, so `x/` and `x` are one value. */
+const normUpstream = (u) => (u ? String(u).replace(/\/+$/, '') : null);
 
 /**
  * Call the cloud with this till's credentials.
@@ -121,10 +125,37 @@ router.get('/edge/info', (req, res) =>
 
 router.put('/edge/config', authRequired, wrap((req, res) => {
   const { upstream, device_id, branch_id } = req.body || {};
-  if (upstream !== undefined) setSetting('edge_upstream_url', upstream ? String(upstream).replace(/\/+$/, '') : null);
+  const next = upstream === undefined ? undefined : normUpstream(upstream);
+
+  // Repointing the till is device management, not a preference.
+  //
+  // The stored `edge_device_token` is a *cloud-issued* bearer for the paired
+  // owner, and `upstreamFetch` presents it to whatever address is stored here. If
+  // any signed-in employee could change that address, the next drain or
+  // `/edge/cloud-branches` call would hand the owner's cloud token to whatever host
+  // they typed in. So a genuine change needs `device.manage` AND drops the old
+  // credentials: a token minted by one host is never presented to another. Sync
+  // resumes after `/edge/pair`.
+  //
+  // A same-value re-send stays open to any session, because that is exactly what
+  // the app does on every login (`configureEdgeUpstream`) and on branch switch.
+  if (next !== undefined && next !== normUpstream(upstreamUrl())) {
+    const perms = req.permissions || getPermissions(req.user.role, req.user.company_id);
+    if (!perms.includes('device.manage'))
+      return res.status(403).json({ error: 'Forbidden: insufficient permissions' });
+    setSetting('edge_upstream_url', next);
+    setSetting('edge_device_token', null);
+    setSetting('edge_device_user', null);
+    setSetting('edge_paired_at', null);
+  } else if (next !== undefined) {
+    setSetting('edge_upstream_url', next);
+  }
+
   if (device_id !== undefined) setSetting('edge_device_id', device_id || null);
   if (branch_id !== undefined) setSetting('edge_branch_id', branch_id || null);
-  setSetting('edge_company_id', req.user.company_id);
+  // The authoritative writers are `/edge/pair` and the bootstrap snapshot. A
+  // login-time call must not overwrite this with the caller's own company.
+  if (!setting('edge_company_id')) setSetting('edge_company_id', req.user.company_id);
 
   // Deliberately does NOT store the caller's token: it was minted by this service
   // with the local secret and the cloud would reject it. Cloud credentials come
@@ -261,9 +292,12 @@ router.post('/edge/pair', authRequired, requirePermission('device.manage'), wrap
 /**
  * POST /edge/bootstrap  { branch_id? }
  *
- * Pull the cloud's catalog, stock and PIN users into the local replica. This is
- * the step that makes a fresh till usable offline: without it `users` is empty
- * and `/edge/unlock` cannot verify anybody's PIN.
+ * Pull the cloud's catalog, stock, custom roles and PIN users into the local
+ * replica. This is the step that makes a fresh till usable offline: without it
+ * `users` is empty and `/edge/unlock` cannot verify anybody's PIN, without the
+ * roles a custom-role user resolves to zero permissions, and without each
+ * product's variants the POS loses every "Large +4.000" option and charges the
+ * base price instead.
  *
  * Requires both an online connection and a valid cloud token, so it only ever
  * succeeds while the device is genuinely reachable.

@@ -45,9 +45,10 @@ explicitly (`rm -f data/pos.db && npm run seed`).
 |---|---|
 | `npm start` | Run the server (no watch) |
 | `npm run dev` | Run with `--watch` |
-| `npm test` | Full suite (16 tests) — spawns real cloud + real edge processes |
+| `npm test` | Full suite — spawns real cloud + real edge processes |
 | `npm run seed` | Recreate `data/pos.db` from scratch with demo data |
 | `npm run reset` | Delete the DB, then seed |
+| `npm run cli -- status` | Operator CLI: `status`, `create-company`, `set-password` |
 
 ### Tests
 
@@ -61,6 +62,10 @@ failures being asserted.
   and first-bootstrap onto a till that has never synced
 - `test/stock-policy.test.mjs` — the three stock policies, at checkout and on replay
 - `test/settings.test.mjs` — settings permission boundary, validation, bootstrap allowlist
+- `test/register-once.test.mjs` — one company per till, and the cloud's `ALLOW_SIGNUP` switch
+- `test/web-root.test.mjs` — serving the built SPA from the API process (`WEB_ROOT`),
+  including the two ways it can break: swallowing `/api/*` and caching `index.html`
+- `test/cli.test.mjs` — `src/cli.js` creates exactly one company, with its branch and owner
 
 Tests must run serially (`--test-concurrency=1`) because each one binds real ports.
 
@@ -79,15 +84,60 @@ All configuration is environment variables. There is no config file.
 | `REFRESH_TTL_DAYS` | `30` | Refresh token lifetime |
 | `DB_DIR` | `./data` | Directory for `pos.db` and `uploads/` |
 | `DB_PATH` | `$DB_DIR/pos.db` | Explicit database file path |
+| `WEB_ROOT` | unset | Serve the built web app (`frontend/dist`) from this process, so one port serves the SPA and the API. Cloud only; **ignored in edge mode** |
 | `EDGE_MODE` | unset | `1` runs the embedded edge service |
 | `EDGE_JWT_SECRET` | unset | Edge signing key (set by the Tauri supervisor) |
 | `EDGE_UPSTREAM_URL` | unset | Cloud base URL for the edge drain worker |
+| `ALLOW_SIGNUP` | unset (open) | Set to `0` to close `POST /api/auth/register` on the **cloud**. A till ignores it — it has its own one-time rule |
 | `LOGIN_MAX_FAILS` | `6` | Failed logins before lockout |
 | `LOGIN_WINDOW_MINUTES` | `15` | Rolling window for counting failures |
 | `LOGIN_LOCK_MINUTES` | `15` | Lockout duration |
 
 A missing `JWT_SECRET` silently falls back to a known dev value. Rotate it by
 changing the variable; all existing tokens stop validating.
+
+**Company registration.** `POST /api/auth/register` is the only self-service way to
+create a tenant, and on a **cloud** it stays open unless you set `ALLOW_SIGNUP=0` —
+which is what a deployment owned by a single, already-registered company wants, and
+what you should do once your company exists. On a **till** the flag is ignored: the
+route is open only while the local replica holds no company at all, because the
+till's `companies` row is a copy of the cloud's and a second signup there would be a
+phantom `super_admin` tenant over the local service. See `EDGE.md`.
+
+---
+
+## Deployment
+
+Three supported shapes, all documented in [../deploy/README.md](../deploy/README.md):
+
+| Shape | Entry point | Best for |
+|---|---|---|
+| Docker — one container, API + SPA + named volume | `docker compose up -d --build` | a VPS, or a host that already runs Docker |
+| Linux — systemd unit, dedicated user, offline payload | `sudo ./install.sh` | a shop server with no Docker |
+| Windows — scheduled task running as SYSTEM | double-click `install.cmd` | the same, on Windows |
+
+All three set `WEB_ROOT`, so **one process and one port** serve both the SPA and the
+API: the browser's origin *is* the API, so there is no CORS and no reverse proxy to
+configure. Put nginx/Caddy in front only when you need TLS.
+
+A deployed server is single-tenant, so signup is closed (`ALLOW_SIGNUP=0`) and the
+first company is created out of band, on the console:
+
+```bash
+# Docker
+docker compose run --rm pos node src/cli.js create-company \
+  --company "Nama Perusahaan" --name "Nama Owner" \
+  --email owner@example.com --password "rahasia123"
+
+# anywhere else (systemd/Windows installers ask for the same four values)
+node src/cli.js create-company --company ... --name ... --email ... --password ...
+node src/cli.js status          # database path, company, row counts
+node src/cli.js set-password --email owner@example.com   # recovery; no email is sent
+```
+
+Tills are separate: they embed this same code as an edge service (`EDGE_MODE=1`)
+and are installed from the Tauri bundle, not from these packages. See
+[EDGE.md](./EDGE.md).
 
 ---
 

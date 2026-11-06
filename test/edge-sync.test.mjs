@@ -759,3 +759,267 @@ test('the service accepts and uses a non-loopback upstream', async (t) => {
   assert.ok(boot.body.products > 0, 'products should have replicated from the configured upstream');
 });
 
+/* -------------------------------------------------------------------------- */
+/* 6. Custom roles on a paired till                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Regression: a custom role existed only in the cloud's `roles` table.
+ *
+ * `users.role` is replicated as a bare string, so the till knew the *name* of a
+ * custom role and nothing about what it grants: `getPermissions` found no row,
+ * returned `[]`, and the person could unlock the till and then be bounced out of
+ * every guarded page with no explanation. System roles hid the bug completely —
+ * they live in code on both sides — so it only ever appeared for shops that had
+ * actually created a role, offline, in the field.
+ *
+ * The assertions read the real replica file as well as the HTTP surface, because
+ * the defect was a missing row: a route check that passed for another reason
+ * would hide it.
+ */
+test('a custom role replicates to the till and grants its permissions offline', async (t) => {
+  const world = await startPairedWorld();
+  t.after(() => world.stop());
+
+  const { api } = world;
+  const { branchId, token } = world.seeded;
+
+  // A role that may look at stock but must not read the audit trail: one held
+  // permission and one withheld gives the test a positive and a negative case.
+  const role = await api.cloud.post('/api/roles', {
+    token,
+    body: {
+      name: 'supervisor_shift',
+      description: 'Kasir senior yang boleh buka shift',
+      permissions: ['transaction.create', 'stock.view'],
+    },
+  });
+  assert.ok(role.status < 300, `role create failed: ${JSON.stringify(role.body)}`);
+
+  const pin = '9876';
+  const user = await api.cloud.post('/api/users', {
+    token,
+    body: {
+      name: 'Sinta',
+      email: 'sinta@uji.id',
+      password: 'rahasia123',
+      role: 'supervisor_shift',
+      branch_id: branchId,
+      pin,
+    },
+  });
+  assert.ok(user.status < 300, `user create failed: ${JSON.stringify(user.body)}`);
+  const userId = user.body.id || user.body.user?.id;
+  assert.equal(user.body.role, 'supervisor_shift');
+
+  // The payload carries roles separately from the users that name them, so a till
+  // can sync roles without re-pulling the roster.
+  const snapshot = await api.cloud.get(`/api/sync/bootstrap?branch_id=${branchId}`, { token });
+  assert.equal(snapshot.status, 200);
+  const shipped = (snapshot.body.roles || []).find((r) => r.name === 'supervisor_shift');
+  assert.ok(shipped, 'the bootstrap payload must carry custom roles');
+  assert.deepEqual([...shipped.permissions].sort(), ['stock.view', 'transaction.create']);
+  assert.ok(
+    !(snapshot.body.roles || []).some((r) => r.name === 'cashier'),
+    'system roles stay in code; shipping them would let the copies drift',
+  );
+
+  // Re-sync, as Settings › Diagnostik does.
+  const boot = await api.edge.post('/api/edge/bootstrap', {
+    token: world.edge.adminToken,
+    body: { branch_id: branchId },
+  });
+  assert.ok(boot.status < 300, `re-bootstrap failed: ${JSON.stringify(boot.body)}`);
+  assert.equal(boot.body.roles, 1, 'the custom role is replicated');
+  const healthyAdminToken = boot.body.token || world.edge.adminToken;
+
+  // The row itself — the thing that was missing.
+  // `startPairedWorld` keeps the server handles under `servers` and uses `edge`
+  // for the token bundle, so the replica path is `servers.edge.dataDir`.
+  const replica = openReplica(world.servers.edge.dataDir);
+  try {
+    const row = replica.prepare('SELECT name, permissions FROM roles WHERE name = ?').get('supervisor_shift');
+    assert.ok(row, 'the roles row must exist in the replica');
+    assert.deepEqual(JSON.parse(row.permissions).sort(), ['stock.view', 'transaction.create']);
+  } finally {
+    replica.close();
+  }
+
+  // Offline login now grants the role's permissions instead of an empty list.
+  const unlock = await api.edge.post('/api/edge/unlock', { body: { user_id: userId, pin } });
+  assert.equal(unlock.status, 200, `unlock failed: ${JSON.stringify(unlock.body)}`);
+  assert.deepEqual(
+    [...unlock.body.permissions].sort(),
+    ['stock.view', 'transaction.create'],
+    'a replicated custom role must grant exactly what it grants on the cloud',
+  );
+
+  // Enforced, not merely reported: a route gated on a held permission opens…
+  const overview = await api.edge.get('/api/stock/overview', { token: unlock.body.token });
+  assert.equal(overview.status, 200, 'stock.view from the custom role must open a guarded route');
+
+  // …and one gated on a permission the role does not hold stays shut.
+  const auditDenied = await api.edge.get('/api/audit-logs', { token: unlock.body.token });
+  assert.equal(auditDenied.status, 403, 'a permission the role does not hold must still be refused');
+
+  // An edited role must reach the till on the next sync; otherwise a revoked
+  // permission would keep working on that device forever.
+  const edit = await api.cloud.put(`/api/roles/${role.body.id}`, {
+    token,
+    body: { permissions: ['transaction.create', 'stock.view', 'audit.view'] },
+  });
+  assert.ok(edit.status < 300, `role update failed: ${JSON.stringify(edit.body)}`);
+
+  const boot2 = await api.edge.post('/api/edge/bootstrap', {
+    token: healthyAdminToken,
+    body: { branch_id: branchId },
+  });
+  assert.ok(boot2.status < 300, `second re-bootstrap failed: ${JSON.stringify(boot2.body)}`);
+  assert.equal(boot2.body.roles, 1, 'a re-sync refreshes the role rather than duplicating it');
+
+  const replica2 = openReplica(world.servers.edge.dataDir);
+  try {
+    const n = replica2.prepare('SELECT COUNT(*) AS n FROM roles WHERE name = ?').get('supervisor_shift').n;
+    assert.equal(n, 1, 'one row per role name, however many times the till syncs');
+  } finally {
+    replica2.close();
+  }
+
+  const unlock2 = await api.edge.post('/api/edge/unlock', { body: { user_id: userId, pin } });
+  assert.equal(unlock2.status, 200, `second unlock failed: ${JSON.stringify(unlock2.body)}`);
+  assert.ok(unlock2.body.permissions.includes('audit.view'), 'the edited permission reaches the till');
+
+  const auditAllowed = await api.edge.get('/api/audit-logs', { token: unlock2.body.token });
+  assert.equal(auditAllowed.status, 200, 'the newly granted permission works offline');
+});
+
+/* -------------------------------------------------------------------------- */
+/* 7. Product variants on a paired till                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Regression: variants existed on the cloud only.
+ *
+ * The snapshot has always carried `variants` inside each product, but
+ * `applyBootstrap` never wrote them, so the till's `product_variants` table
+ * stayed empty. The product list counts that table for its Variants column —
+ * every product read 0 — and the POS offers options from it and prices them off
+ * `price_adjustment`, so "Large +4.000" simply did not exist offline and the
+ * drink rang up at its base price.
+ *
+ * Asserted at three levels because each one failed differently: the rows in the
+ * replica, the two read paths the UI uses, and a sale that actually has to charge
+ * the adjustment.
+ */
+test('product variants replicate to the till and price a sale offline', async (t) => {
+  const world = await startPairedWorld();
+  t.after(() => world.stop());
+
+  const { api } = world;
+  const { branchId, token, products } = world.seeded;
+  // Kopi Susu, 18.000, 30 on the shelf.
+  const kopi = products[0];
+
+  const regular = await api.cloud.post(`/api/products/${kopi.id}/variants`, {
+    token,
+    body: { name: 'Regular', variant_type: 'Ukuran', price_adjustment: 0, is_default: 1, sort_order: 1 },
+  });
+  const large = await api.cloud.post(`/api/products/${kopi.id}/variants`, {
+    token,
+    body: { name: 'Large', variant_type: 'Ukuran', price_adjustment: 4000, sort_order: 2 },
+  });
+  assert.ok(regular.status < 300, `variant create failed: ${JSON.stringify(regular.body)}`);
+  assert.ok(large.status < 300, `variant create failed: ${JSON.stringify(large.body)}`);
+
+  const boot = await api.edge.post('/api/edge/bootstrap', {
+    token: world.edge.adminToken,
+    body: { branch_id: branchId },
+  });
+  assert.ok(boot.status < 300, `re-bootstrap failed: ${JSON.stringify(boot.body)}`);
+  assert.equal(boot.body.variants, 2, 'both variants replicate');
+
+  const replica = openReplica(world.servers.edge.dataDir);
+  try {
+    const rows = replica
+      .prepare('SELECT name, price_adjustment FROM product_variants WHERE product_id = ? ORDER BY sort_order')
+      .all(kopi.id);
+    assert.deepEqual(
+      rows.map((r) => [r.name, Number(r.price_adjustment)]),
+      [['Regular', 0], ['Large', 4000]],
+      'the option and its surcharge survive the copy',
+    );
+  } finally {
+    replica.close();
+  }
+
+  // The Products page reads `variant_count`; it read 0 for every product before.
+  const list = await api.edge.get('/api/products', { token: world.edge.edgeToken });
+  assert.equal(list.status, 200, `product list failed: ${JSON.stringify(list.body)}`);
+  assert.equal(list.body.find((p) => p.id === kopi.id)?.variant_count, 2, 'the Variants column is no longer 0');
+
+  // The POS reads variants from the branch catalog.
+  const catalog = await api.edge.get(`/api/branches/${branchId}/catalog`, { token: world.edge.edgeToken });
+  assert.equal(catalog.status, 200, `catalog failed: ${JSON.stringify(catalog.body)}`);
+  const offered = catalog.body.find((p) => p.id === kopi.id);
+  assert.deepEqual((offered?.variants || []).map((v) => v.name), ['Regular', 'Large']);
+
+  // Offline, a drink sold as "Large" has to cost 18.000 + 4.000. This is the
+  // assertion that would have caught a wrong `price_adjustment` even if the rows
+  // had replicated: the till had no option at all, so it charged the base price.
+  const sale = await api.edge.post('/api/transactions', {
+    token: world.edge.edgeToken,
+    body: {
+      branch_id: branchId,
+      client_uuid: 'variant-offline-1',
+      items: [{ product_id: kopi.id, variant_id: large.body.id, variant_label: 'Large', quantity: 1, price: kopi.default_price }],
+      payment_method: 'cash',
+      cash_received: 50000,
+    },
+  });
+  assert.equal(sale.status, 201, `sale failed: ${JSON.stringify(sale.body)}`);
+  assert.equal(sale.body.total, 22000, 'the surcharge is charged offline, not just displayed');
+  assert.equal(sale.body.items[0].variant_label, 'Large');
+  assert.equal(sale.body.items[0].price, 22000);
+
+  // Re-syncing refreshes the rows instead of duplicating them.
+  const boot2 = await api.edge.post('/api/edge/bootstrap', {
+    token: world.edge.adminToken,
+    body: { branch_id: branchId },
+  });
+  assert.ok(boot2.status < 300, `second re-bootstrap failed: ${JSON.stringify(boot2.body)}`);
+  assert.equal(boot2.body.variants, 2);
+
+  // Switching a variant off in the cloud retires it on the till. The payload
+  // ships active variants only, so a till that merely upserted would keep
+  // offering — and charging for — an option the shop has withdrawn.
+  const off = await api.cloud.put(`/api/variants/${large.body.id}`, { token, body: { is_active: 0 } });
+  assert.ok(off.status < 300, `variant update failed: ${JSON.stringify(off.body)}`);
+
+  const boot3 = await api.edge.post('/api/edge/bootstrap', {
+    token: world.edge.adminToken,
+    body: { branch_id: branchId },
+  });
+  assert.ok(boot3.status < 300, `third re-bootstrap failed: ${JSON.stringify(boot3.body)}`);
+  assert.equal(boot3.body.variants, 1, 'only the active variant ships');
+
+  const catalog2 = await api.edge.get(`/api/branches/${branchId}/catalog`, { token: world.edge.edgeToken });
+  assert.deepEqual(
+    (catalog2.body.find((p) => p.id === kopi.id)?.variants || []).map((v) => v.name),
+    ['Regular'],
+    'the withdrawn option is no longer offered',
+  );
+
+  const replica2 = openReplica(world.servers.edge.dataDir);
+  try {
+    const rows = replica2
+      .prepare('SELECT name, is_active FROM product_variants WHERE product_id = ? ORDER BY name')
+      .all(kopi.id);
+    assert.equal(rows.length, 2, 'the row is deactivated, not deleted: old receipts still name it');
+    assert.equal(Number(rows.find((r) => r.name === 'Large').is_active), 0);
+    assert.equal(Number(rows.find((r) => r.name === 'Regular').is_active), 1);
+  } finally {
+    replica2.close();
+  }
+});
+
+

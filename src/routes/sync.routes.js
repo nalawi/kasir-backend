@@ -213,6 +213,10 @@ router.get('/sync/bootstrap', authRequired, wrap((req, res) => {
        ORDER BY p.name`
     )
     .all(branch_id, branch_id, req.user.company_id);
+  // Nested under each product by the response below. `is_active = 1` only: a
+  // variant the shop switched off must not reach the till, and the till
+  // deactivates any local variant the snapshot no longer lists, so a toggle here
+  // takes effect on the next sync instead of lingering as a stale option.
   const variants = db
     .prepare(
       `SELECT v.* FROM product_variants v JOIN products p ON p.id = v.product_id
@@ -220,6 +224,35 @@ router.get('/sync/bootstrap', authRequired, wrap((req, res) => {
     )
     .all(req.user.company_id);
   const categories = db.prepare('SELECT * FROM categories WHERE company_id = ? ORDER BY name').all(req.user.company_id);
+
+  // Custom roles, shipped because `users.role` is only a string.
+  //
+  // Without this, the till replicated the roster but nobody's permissions: a
+  // staff member assigned a custom role unlocked the till and then had every
+  // guarded page bounce them to the dashboard, with nothing on screen explaining
+  // why. The role resolved to `[]` because the replica had no `roles` row to
+  // resolve it against — a failure that only appears offline, in the field.
+  //
+  // System roles are deliberately absent: they live in code (`permissions.js`) on
+  // both sides, so shipping them would only invite the two copies to drift.
+  // `company_id IS NULL` is included for parity with `getPermissions`, which
+  // accepts a global role row as a fallback.
+  const roles = db
+    .prepare('SELECT name, permissions FROM roles WHERE company_id = ? OR company_id IS NULL ORDER BY name')
+    .all(req.user.company_id)
+    .map((r) => {
+      let permissions = [];
+      try {
+        const parsed = JSON.parse(r.permissions || '[]');
+        if (Array.isArray(parsed)) permissions = parsed;
+      } catch {
+        // A corrupt row must not take the whole bootstrap down: the till then
+        // sees a role that grants nothing, which is the safe direction.
+        permissions = [];
+      }
+      return { name: r.name, permissions };
+    });
+
   res.json({
     synced_at: new Date().toISOString(),
     company: {
@@ -233,6 +266,7 @@ router.get('/sync/bootstrap', authRequired, wrap((req, res) => {
     },
     branch: { id: branch.id, name: branch.name, address: branch.address, phone: branch.phone },
     categories,
+    roles,
     products: products.map((p) => ({ ...p, variants: variants.filter((v) => v.product_id === p.id) })),
     settings: Object.fromEntries(
       db

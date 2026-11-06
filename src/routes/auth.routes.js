@@ -5,29 +5,11 @@ import {
   authRequired, requirePermission, signToken, getPermissions, audit, issueRefreshToken,
   revokeRefreshToken, rotateRefreshToken, isLocked, recordAttempt, lockInfo, revokeAllUserTokens
 } from '../auth.js';
-import { id, publicUser, badRequest, wrap } from '../lib/helpers.js';
+import { publicUser, badRequest, wrap } from '../lib/helpers.js';
+import { bootstrapCompany } from '../lib/bootstrap.js';
+import { isEdge } from '../edge.js';
 
 const router = express.Router();
-
-function bootstrapCompany({ companyName, name, email, password }) {
-  const companyId = id();
-  const userId = id();
-  const branchId = id();
-  const hash = bcrypt.hashSync(password, 10);
-  const tx = db.transaction(() => {
-    db.prepare('INSERT INTO companies (id, name, email) VALUES (?, ?, ?)').run(companyId, companyName, email);
-    db.prepare(
-      `INSERT INTO branches (id, company_id, name, address, opening_hours)
-       VALUES (?, ?, ?, ?, ?)`
-    ).run(branchId, companyId, 'Cabang Utama', null, '08:00-22:00');
-    db.prepare(
-      `INSERT INTO users (id, company_id, branch_id, name, email, password_hash, role)
-       VALUES (?, ?, ?, ?, ?, ?, 'super_admin')`
-    ).run(userId, companyId, branchId, name, email, hash);
-  });
-  tx();
-  return db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
-}
 
 function authPayload(user, deviceId = null) {
   return {
@@ -38,7 +20,48 @@ function authPayload(user, deviceId = null) {
   };
 }
 
+/**
+ * Whether this server may still create a company.
+ *
+ * The till runs the very same route, but its `companies` table is a *replica* of
+ * the cloud's: a second row there is not a new signup, it is a phantom tenant
+ * holding `super_admin` over the local service — every permission, the paired
+ * cloud token, the outbox — and no bootstrap ever removes it. So a till allows
+ * registration exactly once, during first-run setup while the table is still
+ * empty; that one registration is the only way to obtain the `device.manage`
+ * session which `/api/edge/pair` requires, so it cannot simply be switched off.
+ *
+ * The cloud keeps ordinary self-service signup unless the operator closes it with
+ * `ALLOW_SIGNUP=0`, which is what a single-tenant install (the company is already
+ * registered) wants.
+ *
+ * Exported because `GET /api/health` reports it: the login page hides the Register
+ * tab when it is false, and the route refuses anyway.
+ */
+export function registrationState() {
+  if (isEdge()) {
+    const company = db.prepare('SELECT name FROM companies LIMIT 1').get();
+    return company
+      ? { open: false, mode: 'edge', reason: 'perangkat-sudah-terdaftar', company: company.name }
+      : { open: true, mode: 'edge', reason: null, company: null };
+  }
+  const closed = /^(0|false|off|no)$/i.test(String(process.env.ALLOW_SIGNUP ?? ''));
+  return { open: !closed, mode: 'cloud', reason: closed ? 'signup-diminta-oleh-operator' : null, company: null };
+}
+
 router.post('/register', wrap((req, res) => {
+  // Refused before touching `companies`, so a blocked attempt leaves no trace.
+  const state = registrationState();
+  if (!state.open) {
+    return res.status(state.mode === 'edge' ? 409 : 403).json({
+      error:
+        state.mode === 'edge'
+          ? `Perangkat ini sudah terdaftar${state.company ? ` pada perusahaan "${state.company}"` : ''}. ` +
+            'Pendaftaran hanya bisa dilakukan sekali saat penyiapan awal perangkat. ' +
+            'Tambahkan pengguna dari server pusat.'
+          : 'Pendaftaran perusahaan baru dinonaktifkan oleh administrator server.'
+    });
+  }
   const { company_name, name, email, password } = req.body;
   if (!company_name || !name || !email || !password)
     return badRequest(res, 'company_name, name, email, password required');

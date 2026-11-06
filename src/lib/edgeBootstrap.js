@@ -29,6 +29,14 @@ const nowIso = () => new Date().toISOString();
  * of PIN-capable users including `pin_hash`, so offline login verifies against
  * the same bcrypt hash the cloud checks.
  *
+ * The snapshot carries the company's custom roles as well as the catalog: a till
+ * that replicated `users.role` strings without the roles they name left every
+ * custom-role user able to unlock the till and unable to open a single page.
+ *
+ * It also carries each product's variants, which the POS needs in order to offer
+ * "Large +4.000" and to price it: without the rows the catalog looked correct and
+ * every variant silently disappeared.
+ *
  * Returns a summary for the UI and logs.
  */
 export function applyBootstrap({ snapshot, users = [], branchId }) {
@@ -36,6 +44,7 @@ export function applyBootstrap({ snapshot, users = [], branchId }) {
 
   const run = db.transaction(() => {
     const productIds = [];
+    let variantCount = 0;
 
     // Parents first: every replicated row references companies/branches, and on a
     // till paired to a different cloud those rows do not exist yet. UPSERT keeps
@@ -89,6 +98,37 @@ export function applyBootstrap({ snapshot, users = [], branchId }) {
          price_override = excluded.price_override, is_available = 1`
     );
 
+    // Variants: the third thing a till sells, and the one it used to have to
+    // guess. The POS offers "Large +4.000" out of `product_variants`, `GET
+    // /products` counts them for the Variants column, and `priceCart` adds
+    // `price_adjustment` to the branch price. None of that worked offline because
+    // the rows were never copied: every product arrived with a variant count of
+    // 0 and the POS silently charged the base price. The snapshot has carried
+    // `variants` inside each product since it was written; this is the half that
+    // applies it.
+    const variantById = db.prepare('SELECT id FROM product_variants WHERE id = ?');
+    const variantByTwin = db.prepare(
+      'SELECT id FROM product_variants WHERE product_id = ? AND name = ? AND variant_type = ? LIMIT 1'
+    );
+    const localActiveVariants = db.prepare(
+      'SELECT id FROM product_variants WHERE product_id = ? AND is_active = 1'
+    );
+    const deactivateVariant = db.prepare('UPDATE product_variants SET is_active = 0 WHERE id = ?');
+    const upsertVariant = db.prepare(
+      `INSERT INTO product_variants (id, company_id, product_id, name, variant_type,
+                                     price_adjustment, is_default, is_active, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         company_id = excluded.company_id,
+         product_id = excluded.product_id,
+         name = excluded.name,
+         variant_type = excluded.variant_type,
+         price_adjustment = excluded.price_adjustment,
+         is_default = excluded.is_default,
+         is_active = 1,
+         sort_order = excluded.sort_order`
+    );
+
     // Categories must land before products: `products.category_id` has a foreign
     // key to `categories(id)`, so inserting a product that references a category
     // this till has never seen fails with FOREIGN KEY constraint failed. A fresh
@@ -121,6 +161,42 @@ export function applyBootstrap({ snapshot, users = [], branchId }) {
         `bs_${branchRow}_${p.id}`, branchRow, p.id, p.stock ?? 0, p.low_stock_threshold ?? 5, nowIso()
       );
       upsertBranchPrice.run(`bp_${branchRow}_${p.id}`, branchRow, p.id, p.price);
+
+      // Variants of this product. Kept per product so a variant is only ever
+      // written for a product this replica actually holds: `product_id` is a
+      // foreign key, and the snapshot still lists variants of products that were
+      // filtered out here (inactive, or hidden at this branch).
+      const keptVariantIds = new Set();
+      for (const v of Array.isArray(p.variants) ? p.variants : []) {
+        if (!v || typeof v.name !== 'string' || !v.name) continue;
+        const type = v.variant_type || 'option';
+        // Prefer the cloud's id, but adopt a row this till already holds under
+        // the same (product, name, type): a till lets a manager create variants
+        // locally, and a second row for one option would leave the POS charging
+        // whichever of the two it happened to read. Same reasoning as custom
+        // roles, which are keyed on name for the same reason.
+        let variantId = v.id;
+        if (!variantId || !variantById.get(variantId)) {
+          const twin = variantByTwin.get(p.id, v.name, type);
+          if (twin && !keptVariantIds.has(twin.id)) variantId = twin.id;
+        }
+        if (!variantId) variantId = `pv_${p.id}_${keptVariantIds.size}`;
+        keptVariantIds.add(variantId);
+        upsertVariant.run(
+          variantId, companyId, p.id, v.name, type,
+          Number(v.price_adjustment) || 0, v.is_default ? 1 : 0, Number(v.sort_order) || 0
+        );
+        variantCount += 1;
+      }
+
+      // A variant switched off (or deleted) in the cloud is absent from the
+      // snapshot, so the loop above cannot see it. Deactivate rather than delete:
+      // yesterday's receipts and transaction_items still name it, and a row left
+      // active would keep offering — and charging — an option the shop has
+      // already withdrawn.
+      for (const row of localActiveVariants.all(p.id)) {
+        if (!keptVariantIds.has(row.id)) deactivateVariant.run(row.id);
+      }
     }
 
 
@@ -132,6 +208,45 @@ export function applyBootstrap({ snapshot, users = [], branchId }) {
         `UPDATE products SET is_active = 0
          WHERE company_id = ? AND is_active = 1 AND id NOT IN (${marks})`
       ).run(companyId, ...productIds);
+    }
+
+    // Custom roles land before the roster, and they are what makes a replicated
+    // `users.role` mean anything. `users.role` is a bare string: without a `roles`
+    // row to resolve it against, `getPermissions` returns `[]`, so a staff member
+    // on a custom role could unlock the till and then have every guarded page
+    // bounce them to the dashboard with no explanation. That failure only shows up
+    // offline, in the field, which is exactly where it hurts most.
+    //
+    // System roles are not in the payload: they live in code (`permissions.js`) on
+    // both sides, so replicating them would only let two copies drift.
+    //
+    // Keyed on the role *name*, because name is what `users.role` stores. A till
+    // that created the same role locally has a row with a different id, so the id
+    // is derived from (company, name) — the same trick `bs_`/`bp_` above use — and
+    // an existing local row is reused rather than duplicated. Two rows for one
+    // name would let `getPermissions`' single-row lookup return either.
+    //
+    // Rows deleted in the cloud are left alone rather than pruned: a role cannot
+    // be deleted while a user holds it, so a leftover row is unreferenced, and
+    // deleting blindly would also wipe roles this replica legitimately created.
+    let roleCount = 0;
+    if (Array.isArray(snapshot.roles) && snapshot.roles.length) {
+      const findRole = db.prepare('SELECT id FROM roles WHERE company_id = ? AND name = ? LIMIT 1');
+      const upsertRole = db.prepare(
+        `INSERT INTO roles (id, company_id, name, permissions, is_system)
+         VALUES (?, ?, ?, ?, 0)
+         ON CONFLICT(id) DO UPDATE SET
+           name = excluded.name,
+           permissions = excluded.permissions,
+           company_id = excluded.company_id`
+      );
+      for (const r of snapshot.roles) {
+        if (!r || typeof r.name !== 'string' || !r.name) continue;
+        const permissions = JSON.stringify(Array.isArray(r.permissions) ? r.permissions : []);
+        const local = findRole.get(companyId, r.name);
+        upsertRole.run(local ? local.id : `role_${companyId}_${r.name}`, companyId, r.name, permissions);
+        roleCount += 1;
+      }
     }
 
     // The branch roster. Without these rows the till cannot authenticate anybody
@@ -232,6 +347,14 @@ export function applyBootstrap({ snapshot, users = [], branchId }) {
       // provisioned while nobody could log in to it.
       pin_users: pinUserCount,
       categories: Array.isArray(snapshot.categories) ? snapshot.categories.length : 0,
+      // Variants replicated. Separate from `products` because a catalog can look
+      // complete (every product, every price) while the POS still cannot sell
+      // "Large": that is what happened when the count was silently zero.
+      variants: variantCount,
+      // Custom roles replicated. Split out so a shop can tell the difference
+      // between "the roster came over" and "the roster can actually do its job":
+      // with 6 users and 0 roles, everybody on a custom role is locked out.
+      roles: roleCount,
       synced_at: snapshot.synced_at || nowIso(),
     };
   });
