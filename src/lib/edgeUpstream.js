@@ -73,6 +73,54 @@ async function refreshDeviceToken() {
 }
 
 /**
+ * Download a file with this till's credentials.
+ *
+ * The same credential rules as `upstreamRequest` — stored device token, one refresh
+ * on a 401, no second retry — but the reply is binary, so it cannot go through the
+ * JSON helper (which reads text and parses it).
+ *
+ * Errors are raised the way the routes expect: a transport failure keeps the
+ * original message so `transportMessage` can rewrite it into "check the internet",
+ * and a refusal carries the cloud's own wording.
+ */
+export async function upstreamFetchBytes(path) {
+  const base = upstreamUrl();
+  if (!base) throw new Error('Server pusat belum diatur');
+  const bearer = setting('edge_device_token');
+  if (!bearer) throw new Error('Perangkat belum terhubung ke server pusat');
+
+  const attempt = async (token) => {
+    const r = await fetch(`${base}${path}`, { headers: { Authorization: `Bearer ${token}` } });
+    if (r.status === 401) {
+      // Drain the body so the socket is released before a retry or a throw.
+      await r.text().catch(() => '');
+      return { unauthorized: true };
+    }
+    if (!r.ok) {
+      const text = await r.text().catch(() => '');
+      let message = `Server pusat menolak (${r.status})`;
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && parsed.error) message = parsed.error;
+      } catch {
+        /* not JSON — the status code is all we have */
+      }
+      throw new Error(message);
+    }
+    return { buffer: Buffer.from(await r.arrayBuffer()) };
+  };
+
+  let res = await attempt(bearer);
+  if (res.unauthorized) {
+    const fresh = await refreshDeviceToken().catch(() => null);
+    if (!fresh) throw new Error('invalid or expired token');
+    res = await attempt(fresh);
+    if (res.unauthorized) throw new Error('invalid or expired token');
+  }
+  return res;
+}
+
+/**
  * Call the cloud with this till's credentials.
  *
  * The background worker has no user on screen, so it replays with the stored

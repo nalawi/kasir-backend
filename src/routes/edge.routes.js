@@ -8,6 +8,7 @@
 //                              (changing it needs device.manage and drops the pairing)
 //   POST /api/edge/pair        log in to the cloud once, keep its token for sync
 //   POST /api/edge/bootstrap   pull catalog + stock + PIN users into the replica
+//   POST /api/edge/sync-assets re-pull product/staff photos (the file half of a pull)
 //   GET  /api/edge/queue       outbox summary (sync badge)
 //   GET  /api/edge/queue/problems  rows stuck in conflict/rejected for review
 //   POST /api/edge/queue/retry requeue a refused sale after a manual fix
@@ -24,6 +25,7 @@ import { drainQueueOnce, queueSyncSummary } from '../lib/edgeQueueSync.js';
 import { drainHoldsOnce, holdSyncSummary } from '../lib/edgeHoldSync.js';
 import { upstreamUrl, upstreamRequest } from '../lib/edgeUpstream.js';
 import { applyBootstrap } from '../lib/edgeBootstrap.js';
+import { syncAssets, localAssetCount } from '../lib/edgeAssets.js';
 import { verifyPinHash } from '../edge.js';
 
 const router = express.Router();
@@ -96,6 +98,14 @@ router.get('/edge/info', (req, res) =>
     company_id: setting('edge_company_id'),
     branch_id: setting('edge_branch_id'),
     cached_logins: db.prepare('SELECT COUNT(*) AS n FROM users WHERE pin_hash IS NOT NULL AND is_active = 1').get().n,
+    // Product photos this till holds, and when it last refreshed them. A till with a
+    // full catalogue and `assets.files: 0` is exactly the bug this reports on: the rows
+    // replicated but the image files never did.
+    assets: {
+      files: localAssetCount(),
+      synced_at: setting('edge_assets_synced_at'),
+      pending: Number(setting('edge_assets_pending') || 0),
+    },
     queue: outboxSummary(null),
   })
 );
@@ -338,6 +348,19 @@ router.post('/edge/bootstrap', authRequired, wrap(async (req, res) => {
     const summary = applyBootstrap({ snapshot, users, branchId });
     setSetting('edge_branch_id', branchId);
 
+    // Then the photos the catalog just referred to. Separate step, separate failure:
+    // a till whose images could not be fetched is still fully usable offline — it rings
+    // up sales with or without thumbnails — so this reports a count instead of failing
+    // the replication the operator actually asked for. The next bootstrap, the service
+    // restart or the "Salin gambar" button retries it.
+    let assets = null;
+    let assetsError = null;
+    try {
+      assets = await syncAssets({ branchId });
+    } catch (e) {
+      assetsError = transportMessage(e);
+    }
+
     // Bootstrap can re-point the caller's own row at the cloud's company (see
     // applyBootstrap: leaving `company_id` stale is what made every page 403). The
     // bearer that arrived here was signed with the *old* company, so authRequired
@@ -348,7 +371,30 @@ router.post('/edge/bootstrap', authRequired, wrap(async (req, res) => {
     const me = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.sub);
     if (me && me.company_id !== callerCompany) token = signToken(me);
 
-    res.json({ ok: true, ...summary, users_error: usersError, token });
+    res.json({ ok: true, ...summary, assets, assets_error: assetsError, users_error: usersError, token });
+  } catch (e) {
+    res.status(502).json({ error: transportMessage(e) });
+  }
+}));
+
+/**
+ * POST /edge/sync-assets  { branch_id? }
+ *
+ * Re-pull the product/staff photos on their own.
+ *
+ * The bootstrap already does this, but photos are the one part of replication an
+ * operator can sensibly retry without refetching the whole catalogue — after a photo
+ * was added in the cloud, after the internet came back, or once a till has been
+ * restored from a backup that carried the database but not the files. Unlike the
+ * bootstrap's copy, a failure here *is* the answer, so it is reported as an error.
+ */
+router.post('/edge/sync-assets', authRequired, wrap(async (req, res) => {
+  if (!upstreamUrl()) return badRequest(res, 'Server pusat belum diatur');
+  const branchId = (req.body && req.body.branch_id) || setting('edge_branch_id');
+  if (!branchId) return badRequest(res, 'branch_id required');
+  try {
+    const summary = await syncAssets({ branchId });
+    res.json({ ok: true, ...summary });
   } catch (e) {
     res.status(502).json({ error: transportMessage(e) });
   }

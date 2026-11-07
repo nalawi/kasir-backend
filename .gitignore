@@ -8,4 +8,7 @@ data/edge-secret.key
 data/*.db-shm
 data/*.db-wal
 
+# macOS folder metadata
+.DS_Store
+
 node_modules/

@@ -7,6 +7,7 @@ import { id, wrap, badRequest, notFound, branchPrice } from '../lib/helpers.js';
 import { parseSpreadsheet, splitHeader, ImportParseError, MAX_IMPORT_BYTES } from '../lib/spreadsheet.js';
 import { PRODUCT_IMPORT_FIELDS, REQUIRED_IMPORT_KEYS } from '../lib/productImportColumns.js';
 import { suggestMapping, computeImportPlan, runProductImport } from '../lib/productImport.js';
+import { UPLOAD_DIR, ensureUploadDir, uploadPath } from '../lib/uploads.js';
 import { isEdge } from '../edge.js';
 
 const router = express.Router();
@@ -35,8 +36,9 @@ function cloudOnly(req, res, next) {
 
 /* --------------------------- PRODUCT IMAGES --------------------------- */
 
-// Same directory server.js serves statically. Resolved from cwd so both agree.
-const UPLOAD_DIR = path.join(process.cwd(), 'data', 'uploads');
+// Same directory `server.js` serves statically, resolved from the data dir rather than
+// from `process.cwd()` — on the embedded edge service those differ, and a photo
+// uploaded on a till used to land where nothing was served. See lib/uploads.js.
 
 const MAX_IMAGE_BYTES = 2 * 1024 * 1024; // 2 MB — plenty for a product thumbnail
 const IMAGE_EXT = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' };
@@ -57,7 +59,7 @@ function saveDataUri(dataUri) {
   if (!ext) return null;
   const buf = Buffer.from(b64, 'base64');
   if (!buf.length || buf.length > MAX_IMAGE_BYTES) return null;
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  ensureUploadDir();
   const filename = `p_${id()}.${ext}`;
   fs.writeFileSync(path.join(UPLOAD_DIR, filename), buf);
   return `/uploads/${filename}`;
@@ -66,10 +68,10 @@ function saveDataUri(dataUri) {
 /** Best-effort removal of an uploaded file so replaced photos don't leak. */
 function removeUpload(imageUrl) {
   if (typeof imageUrl !== 'string' || !imageUrl.startsWith('/uploads/')) return;
-  // Strip the prefix and any query/hash, then confirm the result stays inside UPLOAD_DIR.
-  const name = path.basename(imageUrl.split('?')[0].split('#')[0]);
-  const full = path.join(UPLOAD_DIR, name);
-  if (!full.startsWith(UPLOAD_DIR + path.sep)) return;
+  // `uploadPath` keeps the resolved name inside UPLOAD_DIR; a name that fails it is
+  // not a file this service wrote, so there is nothing to delete.
+  const full = uploadPath(imageUrl.split('?')[0].split('#')[0].slice('/uploads/'.length));
+  if (!full) return;
   try {
     fs.unlinkSync(full);
   } catch {

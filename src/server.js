@@ -3,10 +3,12 @@ import path from 'path';
 import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
-import { initSchema, db, DATA_DIR } from './db.js';
+import { initSchema, db } from './db.js';
 import { isEdge, EDGE_HOST, edgeCorsOptions, localSecret } from './edge.js';
+import { ensureUploadDir, UPLOAD_DIR } from './lib/uploads.js';
 import { startUpstreamWorker } from './lib/edgeOutbox.js';
 import { backfillHolds } from './lib/edgeHoldSync.js';
+import { syncAssets } from './lib/edgeAssets.js';
 
 import authRoutes, { registrationState } from './routes/auth.routes.js';
 import orgRoutes from './routes/org.routes.js';
@@ -36,9 +38,10 @@ const EDGE = isEdge();
 const secret = EDGE ? localSecret() : null;
 
 // Product photos are written to disk (not the DB) and served back under /uploads.
-// The directory is created on boot so a fresh clone works without extra setup.
-const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+// The directory is created on boot so a fresh clone works without extra setup, and
+// it is the same one `catalog.routes.js` writes to — see lib/uploads.js for why that
+// used to differ on a till.
+ensureUploadDir();
 
 const app = express();
 
@@ -196,6 +199,7 @@ if (process.env.NODE_ENV !== 'test') {
     // Carts parked before the hold lane existed were never queued for the cloud;
     // pick them up once so an upgrade mid-shift does not strand them.
     backfillHolds();
+    pullAssetsOnce();
     return startUpstreamWorker({
       branchIds: () => {
         const ids = new Set();
@@ -223,6 +227,31 @@ if (process.env.NODE_ENV !== 'test') {
         /* offline — rows keep their backoff, nothing to report */
       },
     });
+  }
+
+  /**
+   * Fetch any product photo the replica refers to but this machine does not have.
+   *
+   * Runs once per service start, in the background, and is deliberately quiet: a
+   * till that boots without internet must not log an error over something the next
+   * bootstrap or an operator's "Salin gambar" click will fix. Without this, a till
+   * that was bootstrapped *before* the asset lane existed would keep showing broken
+   * thumbnails until somebody re-ran the provisioning step by hand — the database
+   * replica is already complete, only the files were missing.
+   */
+  function pullAssetsOnce() {
+    if (!upstreamUrl()) return;
+    const branchId = db.prepare("SELECT value FROM settings WHERE key = 'edge_branch_id'").get()?.value;
+    if (!branchId) return;
+    syncAssets({ branchId })
+      .then((summary) => {
+        if (summary.downloaded > 0) {
+          console.log(`POS edge assets pulled=${summary.downloaded} kept=${summary.present} failed=${summary.failed}`);
+        }
+      })
+      .catch(() => {
+        /* offline or not paired yet — the next bootstrap retries */
+      });
   }
 
   const shutdown = () => {

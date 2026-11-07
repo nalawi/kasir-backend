@@ -172,7 +172,53 @@ SELECT c.name, u.email, u.role FROM companies c LEFT JOIN users u ON u.company_i
 UPDATE users SET is_active = 0 WHERE company_id = '<phantom company id>';
 ```
 
-## Prerequisites on the till
+## Product photos are files, so they need their own lane
+
+`applyBootstrap` copies `products.image_url` and `users.avatar_url` verbatim —
+typically `/uploads/p_<uuid>.png`. The till then serves `/uploads` from **its own**
+data directory, so a replicated catalogue on a fresh till pointed at a folder that
+did not exist: the rows arrived, the replica was correct, and every thumbnail was
+broken with no error anywhere. The database replica and the blob store are two
+different things and only one of them was being synced.
+
+So photos travel separately, as files:
+
+* `GET /api/sync/assets?branch_id=` (cloud) lists what the branch needs: the photos
+  of its branch-available products and the avatars of its active staff, restricted to
+  names under `/uploads/`. Rows whose file is gone from the cloud's disk are reported
+  in `missing` instead of being offered — one stale path must not fail the pull.
+* `GET /api/sync/assets/:name` (cloud) returns that one file. The name comes off the
+  URL, so it goes through `uploadPath`, which refuses separators, `..` and anything
+  outside the whitelist before any `fs` call.
+* `POST /api/edge/sync-assets` (till) pulls the whole manifest — this is also the
+  retry button in diagnostics.
+* `POST /api/edge/bootstrap` runs it automatically after the replica lands, and
+  returns the outcome as `assets` / `assets_error`.
+
+Why a manifest and per-file fetches rather than inlining base64 in
+`/sync/bootstrap`: base64 inflates by 1.37×, and the catalogue body would then carry
+a shop's entire photo library in one JSON document that has to succeed or fail as a
+whole. Counting photos as `MAX_FILE_BYTES`-capped binary downloads also means an
+8 MB guard per file instead of one unbounded response.
+
+**Skipping is by size, and that is sound here.** Upload names are random per upload
+(`p_<uuid>.<ext>`), so a given name always holds the same bytes — re-uploading a
+photo produces a new name and a new row value. Equal size therefore implies equal
+content, and no checksums are needed. Files land as `<name>.part` and are renamed
+into place, so an interrupted download can never be mistaken for a cached copy. A
+size mismatch counts as a miss and refetches.
+
+It is non-destructive: files that drop out of the manifest stay on disk, because a
+deactivated product still references its photo and reactivating it should not
+blank the image. Progress is recorded in `edge_assets_synced_at` and
+`edge_assets_pending` (settings), which `GET /api/edge/info` reports as
+`assets: { files, synced_at, pending }` for the diagnostics panel.
+
+The pull is a separate failure lane from bootstrap on purpose: a till that cannot
+reach the cloud still gets its catalogue, and only loses photos. `pullAssetsOnce()`
+in `server.js` also runs it at service start (quietly, and only when the till is
+paired), which is what restores photos after someone clears the uploads folder.
+
 
 * Node runtime available on `PATH` (or bundled next to the app).
 * The backend is copied into the bundle via `tauri.conf.json` → `bundle.resources`.

@@ -1,9 +1,11 @@
 import express from 'express';
+import fs from 'fs';
 import { db } from '../db.js';
 import { authRequired, requirePermission, audit, assertBranchAccess } from '../auth.js';
-import { id, wrap, badRequest, toSqlTimestamp } from '../lib/helpers.js';
+import { id, wrap, badRequest, notFound, toSqlTimestamp } from '../lib/helpers.js';
 import { priceCart, persistTransaction, stockPolicy, stockShortfalls } from '../lib/transactions.js';
 import { QUEUE_STATUSES, enqueueFromHold, settleHoldTicket, replaceHoldTicketLines } from '../lib/kitchen.js';
+import { contentTypeOf, nameFromUrl, uploadPath } from '../lib/uploads.js';
 
 const router = express.Router();
 
@@ -445,6 +447,99 @@ router.get('/sync/conflicts', authRequired, wrap((req, res) => {
       return { ...r, detail };
     })
   );
+}));
+
+/* ------------------------------- ASSETS ------------------------------- */
+// Product photos and staff avatars are files, not columns: `products.image_url` holds
+// `/uploads/p_<uuid>.png`. The bootstrap payload ships that path, and a till serves
+// `/uploads` from its own data directory — which starts empty. So a fresh till had a
+// complete catalog whose every photo rendered as a broken image, with no error
+// anywhere: the browser was asking the local service for a file nobody had copied.
+//
+// Two endpoints fix that, and they are deliberately separate from the snapshot. Inline
+// base64 in `/sync/bootstrap` would multiply a 200 KB photo by 1.37 and push a shop's
+// whole catalogue through one JSON body on every sync; a manifest plus per-file pull
+// instead lets the till fetch only the files it is missing, cache them on disk, and
+// re-check cheaply next time.
+
+/**
+ * GET /sync/assets?branch_id=
+ *
+ * Manifest of the image files the snapshot for this branch refers to: each active,
+ * branch-available product's photo plus every active staff avatar. Sized in bytes so
+ * the till can tell a file it already has (same size, same random name) from one it
+ * must download.
+ *
+ * Scoped exactly like `/sync/bootstrap`, so the till is never told about a file for a
+ * product it does not sell. `missing` names files a row points at but that are gone
+ * from disk — reported rather than hidden, because a product page showing a broken
+ * image is the visible symptom of exactly that.
+ */
+router.get('/sync/assets', authRequired, wrap((req, res) => {
+  const { branch_id } = req.query;
+  if (!branch_id) return badRequest(res, 'branch_id required');
+  if (!assertBranchAccess(req, res, branch_id)) return;
+
+  const rows = db
+    .prepare(
+      `SELECT p.image_url AS url
+         FROM products p
+         LEFT JOIN branch_products bp ON bp.product_id = p.id AND bp.branch_id = ?
+        WHERE p.company_id = ? AND p.is_active = 1 AND COALESCE(bp.is_available, 1) = 1
+          AND p.image_url LIKE '/uploads/%'
+       UNION
+       SELECT u.avatar_url AS url
+         FROM users u
+        WHERE u.branch_id = ? AND u.is_active = 1 AND u.avatar_url LIKE '/uploads/%'`
+    )
+    .all(branch_id, req.user.company_id, branch_id);
+
+  const files = [];
+  const missing = [];
+  let bytes = 0;
+  for (const { url } of rows) {
+    // `image_url` is free text: anything that is not a plain `/uploads/<name>` (an
+    // absolute URL, a stray data URI, a path traversal attempt) simply has no file
+    // here, so it is skipped instead of being guessed at.
+    const name = nameFromUrl(url);
+    const full = name ? uploadPath(name) : null;
+    if (!name || !full) continue;
+    let size = 0;
+    try {
+      size = fs.statSync(full).size;
+    } catch {
+      missing.push(name);
+      continue;
+    }
+    files.push({ name, url: `/uploads/${name}`, size });
+    bytes += size;
+  }
+
+  res.json({ branch_id, files, count: files.length, bytes, missing });
+}));
+
+/**
+ * GET /sync/assets/:name — one image, as bytes.
+ *
+ * Authenticated rather than taking the `/uploads` shortcut: the static mount is public
+ * (a till renders `<img src>` without a token), but a *replication* pull is a device
+ * action, so it runs with the till's paired credential and stays inside the same
+ * permission story as the rest of the sync surface. The name comes off the URL, so it
+ * goes through `uploadPath`, which refuses separators, `..` and anything that is not a
+ * bare file name.
+ */
+router.get('/sync/assets/:name', authRequired, wrap((req, res) => {
+  const full = uploadPath(req.params.name);
+  if (!full) return badRequest(res, 'Nama file tidak valid');
+  let size = 0;
+  try {
+    size = fs.statSync(full).size;
+  } catch {
+    return notFound(res, 'Gambar tidak ditemukan di server pusat');
+  }
+  res.setHeader('Content-Type', contentTypeOf(req.params.name));
+  res.setHeader('Content-Length', String(size));
+  res.send(fs.readFileSync(full));
 }));
 
 /**

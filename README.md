@@ -261,7 +261,7 @@ and `GET /api/permissions` the matrix for the caller.
 | `report.routes.js` | daily/sales reports, export |
 | `audit.routes.js` | audit log |
 | `settings.routes.js` | **editable settings, allowlisted** |
-| `sync.routes.js` (`/sync`) | `bootstrap` (full snapshot), `batch` (offline replay) |
+| `sync.routes.js` (`/sync`) | `bootstrap` (full snapshot), `assets` (product/staff photos), `batch` (offline replay) |
 | `edge.routes.js` (`/edge`) | **edge mode only** — health, queue, unlock, config, pair |
 
 In cloud mode `/api/edge/*` is not mounted and returns 404.

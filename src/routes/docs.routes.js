@@ -115,6 +115,8 @@ const REPORT_SYNC_ROUTES = [
   ['/reports/export/stock.csv', 'get', 'Laporan', 'Export stok (CSV)', 'csv'],
   ['/reports/export/shifts.csv', 'get', 'Laporan', 'Export shift (CSV)', 'csv'],
   ['/sync/bootstrap', 'get', 'Sinkronisasi', 'Snapshot offline (produk, varian, stok, role kustom, setting)'],
+  ['/sync/assets', 'get', 'Sinkronisasi', 'Daftar gambar produk/pengguna untuk replika edge (manifest ukuran)'],
+  ['/sync/assets/{name}', 'get', 'Sinkronisasi', 'Unduh satu gambar sebagai biner', 'binary', ['name']],
   ['/sync/batch', 'post', 'Sinkronisasi', 'Kirim batch transaksi offline'],
   ['/sync/queue', 'post', 'Sinkronisasi', 'Terapkan status tiket dapur (KDS) dari edge (absolute, last-write-wins)'],
   ['/sync/holds', 'post', 'Sinkronisasi', 'Terapkan transaksi "On Hold" + tiketnya dari edge (absolute, last-write-wins)'],
@@ -134,10 +136,23 @@ function buildPaths() {
   const all = [...ROUTES, ...STOCK_TX_ROUTES, ...OPS_REPORT_ROUTES, ...REPORT_SYNC_ROUTES];
   for (const [path, method, tag, summary, schema, params] of all) {
     if (!paths[path]) paths[path] = {};
+    // `csv` and `binary` are the two non-JSON bodies this API returns. Saying
+    // "application/json" for a file download makes every generated client parse image
+    // bytes as JSON, so they get their own response shape instead.
     const op = {
       tags: [tag],
       summary,
-      responses: schema === 'csv' ? { 200: { description: 'CSV file' } } : ok(schema || undefined)
+      responses:
+        schema === 'csv'
+          ? { 200: { description: 'CSV file', content: { 'text/csv': { schema: { type: 'string' } } } } }
+          : schema === 'binary'
+            ? {
+                200: {
+                  description: 'File biner (gambar)',
+                  content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } }
+                }
+              }
+            : ok(schema || undefined)
     };
     if (params) op.parameters = params.map(idParam);
     if (PUBLIC_PATHS.has(path)) op.security = [];
