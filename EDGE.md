@@ -50,6 +50,60 @@ is the intended behaviour for a stand-alone outlet.
 
 ## Why the queue is in SQLite, not localStorage
 
+## The other two lanes: kitchen tickets and parked carts
+
+A sale is not the only thing that has to reach the cloud, and the sale replay is
+*terminal*: once `/sync/batch` answers `applied`, nothing revisits that
+transaction. Two small lanes carry the state that keeps changing afterwards.
+
+| lane | table | endpoint | carries |
+| --- | --- | --- | --- |
+| KDS status | `edge_queue_sync` | `POST /api/sync/queue` | one row per ticket: status, timestamps, cancel reason, per-line ticks |
+| On Hold carts | `edge_hold_sync` | `POST /api/sync/holds` | one row per parked cart: header, lines, and its ticket's state |
+
+Both are absolute (last-write-wins), keyed by an id that exists on both sides —
+`transactions.client_uuid` for a sale ticket, the till's own hold id for a parked
+cart — both coalesce a burst of taps into one request, and both drain in the same
+order: sales → holds → ticket status. Holds go before ticket status because the
+cloud must already have the ticket before a status patch can address it.
+
+A hold is cart state, not money: it never entered `edge_outbox`, which is why the
+cloud's Hold list used to stay empty while carts sat parked on the till.
+Discarding or resuming a cart writes a tombstone instead of a snapshot, so the
+cloud's card goes with it; a ticket the bar already started is kept on both sides
+(that work really happened) and stays addressable through `order_queue.origin_ref`
+even after the hold row is gone.
+
+### Resuming a cart must not ask the bar to make it twice
+
+Parking a cart raises a real ticket, because the drinks are made while the customer
+waits. Paying for that cart later — the "resume" flow — therefore must *continue*
+the ticket, not raise a second one: the bar has already handed the order over, and a
+fresh ticket sends it back to the start of the board.
+
+The sale carries `hold_id` (see `POST /api/transactions`), and the checkout path
+hands it to `adoptHoldTicket`, which finds the ticket by `origin_ref` and links it to
+the sale while keeping its number, status and timestamps. Lines the sale added at the
+counter are folded in — more of a drink bumps that line's quantity, a new item becomes
+a new line — and quantities already made are never reduced. `hold_id` travels with the
+replay payload too, so `/api/sync/batch` performs the same adoption on the cloud's
+copy of the ticket instead of duplicating it there.
+
+Tickets the bar never touched are dropped when the cart is resumed (nothing was made),
+so the paid sale simply raises its own ticket in that case.
+
+## Keeping the paired credential alive
+
+The drain runs with the token stored at pairing, which has the cloud's ordinary
+access lifetime (`JWT_EXPIRES`, 60 minutes by default). Pairing therefore also
+stores the refresh token that came with it, and `lib/edgeUpstream.js` exchanges it
+whenever the cloud answers `401` — once, then retries the same request. Without
+that, every lane stopped an hour after pairing with "Invalid or expired token" and
+the only cure was re-pairing by hand. A till whose pairing is genuinely gone (the
+cloud database was reseeded) still reports "re-pair", because its refresh token is
+refused as well.
+
+
 Money must survive a webview cache clear, an app reinstall, or a browser storage
 eviction. `edge_outbox` is a real table with a `client_uuid` primary key.
 

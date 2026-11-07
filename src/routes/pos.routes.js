@@ -80,7 +80,10 @@ router.post('/transactions', authRequired, wrap((req, res) => {
         table_number: req.body.table_number,
         customer_name: req.body.customer_name,
         reference_id: req.body.reference_id,
-        code: req.body.code
+        code: req.body.code,
+        // Set when the cart being paid is a resumed parked ("On Hold") cart: the
+        // sale then takes over that cart's kitchen ticket instead of duplicating it.
+        hold_id: req.body.hold_id || null
       }
     });
   } catch (e) {
@@ -112,6 +115,9 @@ router.post('/transactions', authRequired, wrap((req, res) => {
         order_label: req.body.order_label,
         table_number: req.body.table_number,
         customer_name: req.body.customer_name,
+        // Travels with the replay so the cloud adopts the same parked cart's ticket
+        // and its board does not gain a second ticket for the same order.
+        hold_id: req.body.hold_id || undefined,
       },
     });
   }

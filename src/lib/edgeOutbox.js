@@ -13,6 +13,8 @@
 // cache clear or an app reinstall.
 
 import { db } from '../db.js';
+import { drainQueueOnce } from './edgeQueueSync.js';
+import { drainHoldsOnce } from './edgeHoldSync.js';
 
 const BATCH_SIZE = 50;
 const BASE_DELAY_MS = 15_000;
@@ -184,6 +186,22 @@ export function startUpstreamWorker({ post, branchIds, intervalMs = 20_000, onEr
           if (res.examined) onTick(branchId, res);
         } catch (e) {
           // No internet. The timer keeps running; rows already carry a backoff.
+          // Skip the queue lane too — the same transport just failed.
+          onError(e);
+          continue;
+        }
+        try {
+          // Between the two: a parked cart has to exist on the cloud before the
+          // queue lane patches the ticket that was raised with it.
+          await drainHoldsOnce(branchId, post);
+        } catch (e) {
+          onError(e);
+        }
+        try {
+          // Always after the sale lane, so the cloud ticket exists before we patch
+          // its status. A failure here must not stop the next branch's sales.
+          await drainQueueOnce(branchId, post);
+        } catch (e) {
           onError(e);
         }
       }

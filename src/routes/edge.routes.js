@@ -20,6 +20,9 @@ import { db, DATA_DIR } from '../db.js';
 import { authRequired, getPermissions, audit, signToken, requirePermission } from '../auth.js';
 import { publicUser, wrap, badRequest } from '../lib/helpers.js';
 import { outboxSummary, outboxProblems, retryOutboxRow, drainOnce } from '../lib/edgeOutbox.js';
+import { drainQueueOnce, queueSyncSummary } from '../lib/edgeQueueSync.js';
+import { drainHoldsOnce, holdSyncSummary } from '../lib/edgeHoldSync.js';
+import { upstreamUrl, upstreamRequest } from '../lib/edgeUpstream.js';
 import { applyBootstrap } from '../lib/edgeBootstrap.js';
 import { verifyPinHash } from '../edge.js';
 
@@ -35,43 +38,19 @@ const setSetting = (key, value) =>
     .run(key, value === null || value === undefined ? null : String(value));
 
 /** Cloud base URL this till pushes to, or null when it is stand-alone. */
-export function upstreamUrl() {
-  return setting('edge_upstream_url') || process.env.EDGE_UPSTREAM_URL || null;
-}
+export { upstreamUrl };
 
 /** Address as stored/compared: no trailing slash, so `x/` and `x` are one value. */
 const normUpstream = (u) => (u ? String(u).replace(/\/+$/, '') : null);
 
 /**
- * Call the cloud with this till's credentials.
+ * Call the cloud with this till's credentials (see lib/edgeUpstream.js).
  *
- * The background worker has no user on screen, so it replays with the token that
- * `/edge/config` stored. `token` lets a foreground request use the caller's own
- * token instead, which keeps the cloud's permission checks meaningful.
+ * `token` lets a foreground request use the caller's own token instead of the
+ * paired device token, which keeps the cloud's permission checks meaningful.
  */
-async function upstreamFetch(path, { method = 'GET', token, body, anonymous = false } = {}) {
-  const base = upstreamUrl();
-  if (!base) throw new Error('Server pusat belum diatur');
-  const bearer = anonymous ? null : token || setting('edge_device_token');
-  if (!anonymous && !bearer) throw new Error('Perangkat belum terhubung ke server pusat');
-
-  const r = await fetch(`${base}${path}`, {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
-    },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-  });
-  const text = await r.text();
-  let data = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = null;
-  }
-  if (!r.ok) throw new Error((data && data.error) || `Server pusat menolak (${r.status})`);
-  return data;
+async function upstreamFetch(path, opts = {}) {
+  return upstreamRequest(path, opts);
 }
 
 /**
@@ -145,6 +124,7 @@ router.put('/edge/config', authRequired, wrap((req, res) => {
       return res.status(403).json({ error: 'Forbidden: insufficient permissions' });
     setSetting('edge_upstream_url', next);
     setSetting('edge_device_token', null);
+    setSetting('edge_refresh_token', null);
     setSetting('edge_device_user', null);
     setSetting('edge_paired_at', null);
   } else if (next !== undefined) {
@@ -199,7 +179,29 @@ router.post('/edge/drain', authRequired, wrap(async (req, res) => {
 
   try {
     const result = await drainOnce(branchId, post);
-    res.json({ ...result, queue: outboxSummary(branchId) });
+    // Then parked carts, then ticket status changes. A hiccup in either must not fail
+    // the sale drain the caller asked for — the worker retries each lane on its own
+    // schedule. Holds go first so a hold ticket exists before it is patched.
+    let holdSync = { applied: 0, examined: 0 };
+    try {
+      holdSync = await drainHoldsOnce(branchId, post);
+    } catch {
+      /* keep the sale result; the hold lane backs off and retries */
+    }
+    let queueSync = { applied: 0, examined: 0 };
+    try {
+      queueSync = await drainQueueOnce(branchId, post);
+    } catch {
+      /* keep the sale result; the queue lane backs off and retries */
+    }
+    res.json({
+      ...result,
+      holdSync,
+      holdSyncPending: holdSyncSummary(branchId).pending,
+      queueSync,
+      queueSyncPending: queueSyncSummary(branchId).pending,
+      queue: outboxSummary(branchId)
+    });
   } catch (e) {
     res.status(502).json({ error: transportMessage(e), queue: outboxSummary(branchId) });
   }
@@ -281,6 +283,10 @@ router.post('/edge/pair', authRequired, requirePermission('device.manage'), wrap
   if (!data?.token) return res.status(401).json({ error: 'Server pusat tidak mengembalikan token' });
 
   setSetting('edge_device_token', data.token);
+  // The cloud rotates refresh tokens, and this is the one that keeps the drain
+  // alive after the access token expires (see lib/edgeUpstream.js). An older cloud
+  // that does not issue one just leaves the key unset.
+  if (data.refresh_token) setSetting('edge_refresh_token', data.refresh_token);
   setSetting('edge_device_user', email);
   setSetting('edge_company_id', data.user?.company_id || null);
   if (data.user?.branch_id) setSetting('edge_branch_id', data.user.branch_id);

@@ -180,5 +180,7 @@ export function makeClient(base) {
     get: (p, opts) => call('GET', p, opts),
     post: (p, opts) => call('POST', p, opts),
     put: (p, opts) => call('PUT', p, opts),
+    patch: (p, opts) => call('PATCH', p, opts),
+    del: (p, opts) => call('DELETE', p, opts),
   };
 }

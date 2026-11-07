@@ -1,8 +1,9 @@
 import express from 'express';
 import { db } from '../db.js';
 import { authRequired, requirePermission, audit, assertBranchAccess } from '../auth.js';
-import { id, wrap, badRequest } from '../lib/helpers.js';
+import { id, wrap, badRequest, toSqlTimestamp } from '../lib/helpers.js';
 import { priceCart, persistTransaction, stockPolicy, stockShortfalls } from '../lib/transactions.js';
+import { QUEUE_STATUSES, enqueueFromHold, settleHoldTicket, replaceHoldTicketLines } from '../lib/kitchen.js';
 
 const router = express.Router();
 
@@ -111,6 +112,10 @@ router.post('/sync/batch', authRequired, wrap((req, res) => {
           order_label: tx.order_label,
           table_number: tx.table_number,
           customer_name: tx.customer_name,
+          // The till paid for a cart it had parked; its ticket already exists here
+          // (mirrored by the hold lane), so the sale adopts it instead of raising a
+          // second ticket the bar would have to work twice.
+          hold_id: tx.hold_id || null,
           code: tx.code,
           offline: true
         }
@@ -133,6 +138,276 @@ router.post('/sync/batch', authRequired, wrap((req, res) => {
   });
   res.json({ total: results.length, applied, conflicts, rejected, results });
 }));
+
+/**
+ * Apply a ticket snapshot verbatim: status, timestamps, reason and line ticks.
+ *
+ * Absolute by design — the snapshot is the till's whole current state, so an older
+ * one that arrives late cannot leave the board half-updated. A reopened ticket
+ * ('queue') clears its closing stamps exactly like the till does, so the two boards
+ * agree. `items_done` is positional: both sides built the lines from the same source
+ * list (the `prepared` lines of a sale, or the lines of a hold), in the same order.
+ */
+function applyTicketState(ticketId, state, companyId) {
+  db.prepare(
+    `UPDATE order_queue
+        SET status = ?, started_at = ?, ready_at = ?, completed_at = ?, cancel_reason = ?
+      WHERE id = ? AND company_id = ?`
+  ).run(
+    state.status,
+    state.started_at ? toSqlTimestamp(state.started_at) : null,
+    state.ready_at ? toSqlTimestamp(state.ready_at) : null,
+    state.completed_at ? toSqlTimestamp(state.completed_at) : null,
+    state.cancel_reason != null ? String(state.cancel_reason) : null,
+    ticketId,
+    companyId
+  );
+
+  if (!Array.isArray(state.items_done)) return;
+  const lines = db.prepare('SELECT id FROM order_queue_items WHERE queue_id = ? ORDER BY rowid').all(ticketId);
+  const n = Math.min(lines.length, state.items_done.length);
+  const setDone = db.prepare('UPDATE order_queue_items SET done = ? WHERE id = ?');
+  for (let i = 0; i < n; i += 1) setDone.run(state.items_done[i] ? 1 : 0, lines[i].id);
+}
+
+/**
+ * POST /sync/queue
+ * Body: { branch_id, tickets: [ {origin_uuid, kind, status, started_at, ready_at, completed_at, cancel_reason, items_done} ] }
+ *
+ * Apply the edge's *absolute* state for tickets it originated. The sale replay in
+ * /sync/batch creates the ticket exactly once and never revisits it, so this is the
+ * only path that moves a cloud ticket past its first stage.
+ *
+ * `origin_uuid` identifies the ticket's origin, and `kind` says which:
+ *   (absent) / 'sale' -> `transactions.client_uuid`, the key the replay dedupes on.
+ *                        Resolved to the cloud's transaction, then to its ticket.
+ *   'hold'            -> the till's hold id, mirrored by /sync/holds and stamped on
+ *                        the ticket as `origin_ref`. A parked cart has no sale, and
+ *                        this is what lets its ticket keep moving on the cloud.
+ *
+ * Outcomes:
+ *   applied  -> the ticket's status, timestamps, reason and line ticks are replaced
+ *   pending  -> the sale/hold itself has not applied yet (or its ticket isn't
+ *               created), so the till retries later; we never invent a ticket here
+ *   rejected -> malformed payload / unknown status / branch mismatch
+ *
+ * The edge is authoritative for a ticket it originated, so the write is verbatim:
+ * an older snapshot cannot leave the board half-updated. Re-sending is a no-op.
+ */
+router.post('/sync/queue', authRequired, wrap((req, res) => {
+  const { branch_id, tickets = [] } = req.body;
+  if (!branch_id) return badRequest(res, 'branch_id required');
+  if (!assertBranchAccess(req, res, branch_id)) return;
+  if (!Array.isArray(tickets) || !tickets.length) return badRequest(res, 'tickets required');
+
+  const txStmt = db.prepare('SELECT id, branch_id FROM transactions WHERE company_id = ? AND client_uuid = ?');
+  const saleTicketStmt = db.prepare('SELECT id, branch_id FROM order_queue WHERE company_id = ? AND transaction_id = ?');
+  // A hold ticket has no sale to resolve through, so it is addressed by the ref the
+  // hold lane stamped on it. `hold_order_id` is the fallback for a ticket created
+  // before that ref existed.
+  const holdTicketStmt = db.prepare(
+    `SELECT id, branch_id FROM order_queue
+      WHERE company_id = ? AND transaction_id IS NULL
+        AND (origin_ref = ? OR hold_order_id = ?)
+      ORDER BY rowid LIMIT 1`
+  );
+
+  const results = [];
+  for (const t of tickets) {
+    const origin = t.origin_uuid;
+    if (!origin) {
+      results.push({ origin_uuid: null, status: 'rejected', error: 'origin_uuid required' });
+      continue;
+    }
+    if (!QUEUE_STATUSES.includes(t.status)) {
+      results.push({ origin_uuid: origin, status: 'rejected', error: `Status tidak dikenal: ${t.status}` });
+      continue;
+    }
+
+    let ticket = null;
+    if (t.kind === 'hold') {
+      ticket = holdTicketStmt.get(req.user.company_id, origin, origin);
+      if (!ticket) {
+        // The hold (and the ticket raised with it) has not been mirrored yet.
+        results.push({ origin_uuid: origin, status: 'pending', error: 'tiket hold belum tersinkron' });
+        continue;
+      }
+    } else {
+      const tx = txStmt.get(req.user.company_id, origin);
+      if (!tx) {
+        // The sale is still in the till's outbox (or was parked in conflict).
+        results.push({ origin_uuid: origin, status: 'pending', error: 'transaksi belum tersinkron' });
+        continue;
+      }
+      if (tx.branch_id !== branch_id) {
+        results.push({ origin_uuid: origin, status: 'rejected', error: 'cabang tidak cocok' });
+        continue;
+      }
+      ticket = saleTicketStmt.get(req.user.company_id, tx.id);
+      if (!ticket) {
+        results.push({ origin_uuid: origin, status: 'pending', error: 'tiket belum tersinkron' });
+        continue;
+      }
+    }
+    if (ticket.branch_id !== branch_id) {
+      results.push({ origin_uuid: origin, status: 'rejected', error: 'cabang tidak cocok' });
+      continue;
+    }
+
+    applyTicketState(ticket.id, t, req.user.company_id);
+    results.push({ origin_uuid: origin, status: 'applied', queue_id: ticket.id });
+  }
+
+  res.json({
+    total: results.length,
+    applied: results.filter((r) => r.status === 'applied').length,
+    results
+  });
+}));
+
+/**
+ * POST /sync/holds
+ * Body: { branch_id, holds: [ {hold_id, deleted, hold, items, queue} ] }
+ *
+ * Mirror the till's parked ("On Hold") carts. A hold is cart state, not money, so
+ * it never rode the sale replay: before this lane existed the cloud's Hold list
+ * stayed empty and the kitchen ticket raised for a parked cart existed only on the
+ * till that parked it.
+ *
+ * Every entry is absolute and the till owns the row, so replay is last-write-wins:
+ *   applied  -> the cart (and, when the till had one, its ticket) now matches the till
+ *   rejected -> malformed payload, unknown ticket status, branch mismatch, or a
+ *               hold id already owned by another company
+ *
+ * `deleted: true` is the tombstone the till writes when a cart is resumed into a
+ * sale or discarded: the hold is removed and its untouched ticket settled, exactly
+ * as the till does. A ticket the bar already started is kept — that work really
+ * happened — and is merely detached from the hold, staying reachable through
+ * `origin_ref` for later status patches.
+ */
+router.post('/sync/holds', authRequired, wrap((req, res) => {
+  const { branch_id, holds = [] } = req.body;
+  if (!branch_id) return badRequest(res, 'branch_id required');
+  if (!assertBranchAccess(req, res, branch_id)) return;
+  if (!Array.isArray(holds) || !holds.length) return badRequest(res, 'holds required');
+
+  const companyId = req.user.company_id;
+  const ownerStmt = db.prepare('SELECT company_id FROM hold_orders WHERE id = ?');
+  // The hold id is replayed verbatim, so the same row is addressed by every update
+  // (and by the tombstone) without the cloud minting an id of its own.
+  const upsertHold = db.prepare(
+    `INSERT INTO hold_orders (id, company_id, branch_id, user_id, label, subtotal, discount, tax, total, note, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))
+     ON CONFLICT(id) DO UPDATE SET
+       branch_id = excluded.branch_id,
+       user_id = excluded.user_id,
+       label = excluded.label,
+       subtotal = excluded.subtotal,
+       discount = excluded.discount,
+       tax = excluded.tax,
+       total = excluded.total,
+       note = excluded.note`
+  );
+  const delItems = db.prepare('DELETE FROM hold_order_items WHERE hold_order_id = ?');
+  const insItem = db.prepare(
+    'INSERT INTO hold_order_items (id, hold_order_id, product_id, product_name, variant_label, price, quantity, discount, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  );
+  const ticketByRef = db.prepare(
+    `SELECT id FROM order_queue
+      WHERE company_id = ? AND transaction_id IS NULL
+        AND (origin_ref = ? OR hold_order_id = ?)
+      ORDER BY rowid LIMIT 1`
+  );
+  const stampRef = db.prepare('UPDATE order_queue SET origin_ref = ? WHERE id = ?');
+  const detach = db.prepare('UPDATE order_queue SET hold_order_id = NULL WHERE company_id = ? AND hold_order_id = ?');
+  const delHold = db.prepare('DELETE FROM hold_orders WHERE id = ? AND company_id = ?');
+
+  const num = (v) => Number(v) || 0;
+  const results = [];
+
+  for (const entry of holds) {
+    const holdId = entry.hold_id || entry.hold?.id;
+    if (!holdId) {
+      results.push({ hold_id: null, status: 'rejected', error: 'hold_id required' });
+      continue;
+    }
+    const owner = ownerStmt.get(holdId);
+    if (owner && owner.company_id !== companyId) {
+      results.push({ hold_id: holdId, status: 'rejected', error: 'hold milik perusahaan lain' });
+      continue;
+    }
+    const ticketState = entry.queue && entry.queue.status ? entry.queue : null;
+    if (entry.queue && !ticketState) {
+      results.push({ hold_id: holdId, status: 'rejected', error: 'status tiket tidak dikenal' });
+      continue;
+    }
+    if (ticketState && !QUEUE_STATUSES.includes(ticketState.status)) {
+      results.push({ hold_id: holdId, status: 'rejected', error: `Status tidak dikenal: ${ticketState.status}` });
+      continue;
+    }
+
+    if (entry.deleted) {
+      // Settle before detaching: `settleHoldTicket` finds the ticket through the
+      // hold link, which the detach below clears.
+      settleHoldTicket({ companyId, holdId });
+      const kept = ticketByRef.get(companyId, holdId, holdId);
+      if (kept && ticketState) applyTicketState(kept.id, ticketState, companyId);
+      detach.run(companyId, holdId);
+      delItems.run(holdId);
+      delHold.run(holdId, companyId);
+      results.push({ hold_id: holdId, status: 'applied', settled: true, ticket_id: kept ? kept.id : null });
+      continue;
+    }
+
+    const hold = entry.hold || {};
+    upsertHold.run(
+      holdId, companyId, branch_id, hold.user_id || null, hold.label ?? null,
+      num(hold.subtotal), num(hold.discount), num(hold.tax), num(hold.total), hold.note ?? null,
+      hold.created_at ? toSqlTimestamp(hold.created_at) : null
+    );
+    delItems.run(holdId);
+    for (const it of entry.items || []) {
+      insItem.run(
+        id(), holdId, it.product_id || null, it.product_name || 'Item', it.variant_label || null,
+        num(it.price), num(it.quantity) || 1, num(it.discount), it.note || null
+      );
+    }
+
+    // Raise the same ticket the till raised (same lines, same station routing) the
+    // first time we hear about it, then fold in the till's current state below.
+    let ticketId = null;
+    if (ticketState) {
+      const existing = ticketByRef.get(companyId, holdId, holdId);
+      ticketId = existing ? existing.id : null;
+      if (ticketId) {
+        // An edit to a parked cart changes what the station has to make. The till
+        // re-raises its ticket for that; here the same number is kept and only the
+        // lines are rewritten — and only while the bar has not started them.
+        replaceHoldTicketLines({ companyId, holdId, items: entry.items || [] });
+      } else {
+        ticketId = enqueueFromHold({
+          companyId,
+          branchId: branch_id,
+          userId: hold.user_id || null,
+          holdId,
+          hold: { label: hold.label ?? null, note: hold.note ?? null, created_at: hold.created_at || null },
+          items: entry.items || []
+        });
+        if (ticketId) stampRef.run(holdId, ticketId);
+      }
+      if (ticketId) applyTicketState(ticketId, ticketState, companyId);
+    }
+
+    results.push({ hold_id: holdId, status: 'applied', settled: false, ticket_id: ticketId });
+  }
+
+  res.json({
+    total: results.length,
+    applied: results.filter((r) => r.status === 'applied').length,
+    results
+  });
+}));
+
 
 /** GET /sync/status — queue health for the current branch (sync badge). */
 router.get('/sync/status', authRequired, wrap((req, res) => {

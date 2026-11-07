@@ -685,6 +685,10 @@ test('a stale device token is reported as a re-pair, not a connection failure', 
     '.eyJzdWIiOiJ1c2VyLXRoYXQtbm8tbG9uZ2VyLWV4aXN0cyIsImNvbXBhbnlfaWQiOiJ4Iiwicm9sZSI6InN1cGVyX2FkbWluIn0' +
     '.c2lnbmF0dXJlLW5vdC12ZXJpZmllZC1ieS10aGUtY2xvdWQ';
   setSetting(world.edge.dataDir, 'edge_device_token', stale);
+  // …and the reseeded cloud never saw the till's refresh token either, so the
+  // automatic renewal that heals a merely-expired token cannot help here. Losing
+  // the pairing entirely is exactly the case that must still ask for a re-pair.
+  setSetting(world.edge.dataDir, 'edge_refresh_token', null);
 
   const res = await world.api.edge.get('/api/edge/cloud-branches', { token: edge.adminToken });
 
@@ -702,6 +706,53 @@ test('a stale device token is reported as a re-pair, not a connection failure', 
     !/koneksi internet/i.test(reason),
     `a rejected token must not be blamed on the internet, got: ${reason}`,
   );
+});
+
+/**
+ * An expired (but otherwise valid) device token must be renewed, not fatal.
+ *
+ * The drain authenticates with the token stored at pairing, and that token has the
+ * cloud's ordinary access lifetime. Before this, every lane stopped syncing an hour
+ * after the till was paired — sales, parked carts and kitchen tickets all backed off
+ * forever with "Invalid or expired token" until somebody re-paired by hand.
+ */
+test('an expired device token is renewed instead of losing the queue', async (t) => {
+  const world = await startPairedWorld();
+  t.after(() => world.stop());
+
+  const api = world.api;
+  const { branchId, prepared } = world.seeded;
+
+  // A sale is waiting to go out…
+  const sale = await api.edge.post('/api/transactions', {
+    token: world.edge.edgeToken,
+    body: saleBody({ branchId, productId: prepared.id, quantity: 1, price: prepared.default_price, clientUuid: 'refresh-1' }),
+  });
+  assert.equal(sale.status, 201, JSON.stringify(sale.body));
+
+  // …and an hour later the access token is dead, exactly as `JWT_EXPIRES` makes it.
+  setSetting(world.servers.edge.dataDir, 'edge_device_token', 'expired.not.a.token');
+
+  // The refresh token kept at pairing is the way back in. Tests obtain one the same
+  // way pairing does: a real login against the cloud.
+  const login = await api.cloud.post('/api/auth/login', { body: { email: OWNER.email, password: OWNER.password } });
+  assert.equal(login.status, 200, JSON.stringify(login.body));
+  setSetting(world.servers.edge.dataDir, 'edge_refresh_token', login.body.refresh_token);
+
+  const drain = await api.edge.post('/api/edge/drain', { token: world.edge.edgeToken, body: { branch_id: branchId } });
+  assert.equal(drain.status, 200, `the drain recovers instead of failing: ${JSON.stringify(drain.body)}`);
+  assert.equal(drain.body.applied, 1, 'the queued sale still applies');
+
+  // The replacement pair is persisted, so the next tick does not log in again.
+  const db = openReplica(world.servers.edge.dataDir);
+  try {
+    const token = db.prepare("SELECT value FROM settings WHERE key = 'edge_device_token'").get();
+    const refresh = db.prepare("SELECT value FROM settings WHERE key = 'edge_refresh_token'").get();
+    assert.ok(token.value && token.value !== 'expired.not.a.token', 'a fresh access token was stored');
+    assert.ok(refresh.value && refresh.value !== login.body.refresh_token, 'and the rotated refresh token replaced the old one');
+  } finally {
+    db.close();
+  }
 });
 
 /**
@@ -1021,5 +1072,655 @@ test('product variants replicate to the till and price a sale offline', async (t
     replica2.close();
   }
 });
+
+
+/* -------------------------------------------------------------------------- */
+/* KDS status propagation: the till's board reaches the cloud                 */
+/* -------------------------------------------------------------------------- */
+/*
+ * Regression for the gap this whole lane exists for: a ticket was created on the
+ * cloud once, during the sale replay, and then never updated. The bar could move a
+ * ticket to `preparing`/`ready`/`completed` (or cancel it, or tick a line off) and
+ * the cloud board stayed frozen at `queue` forever.
+ */
+
+/** The till's `order_queue` id for the sale with `clientUuid` (null when none). */
+function edgeTicketId(dataDir, clientUuid) {
+  const db = openReplica(dataDir);
+  try {
+    const row = db
+      .prepare(
+        'SELECT q.id FROM order_queue q JOIN transactions t ON t.id = q.transaction_id WHERE t.client_uuid = ?'
+      )
+      .get(clientUuid);
+    return row ? row.id : null;
+  } finally {
+    db.close();
+  }
+}
+
+/** The cloud ticket (with its lines' done flags) for `clientUuid`, or null if absent. */
+function cloudTicket(dataDir, clientUuid) {
+  const db = openReplica(dataDir);
+  try {
+    const tx = db.prepare('SELECT id FROM transactions WHERE client_uuid = ?').get(clientUuid);
+    if (!tx) return null;
+    const q = db.prepare('SELECT * FROM order_queue WHERE transaction_id = ?').get(tx.id);
+    if (!q) return null;
+    q.items = db.prepare('SELECT product_id, done FROM order_queue_items WHERE queue_id = ? ORDER BY rowid').all(q.id);
+    return q;
+  } finally {
+    db.close();
+  }
+}
+
+test('a ticket walked through the board on the till ends up the same on the cloud', async (t) => {
+  const world = await startPairedWorld();
+  t.after(() => world.stop());
+
+  const api = world.api;
+  const { branchId, prepared } = world.seeded;
+  const clientUuid = 'kds-lifecycle-1';
+
+  const sale = await api.edge.post('/api/transactions', {
+    token: world.edge.edgeToken,
+    body: saleBody({ branchId, productId: prepared.id, quantity: 2, price: prepared.default_price, clientUuid }),
+  });
+  assert.equal(sale.status, 201, 'the prepared-item sale is written locally first');
+
+  const ticketId = edgeTicketId(world.servers.edge.dataDir, clientUuid);
+  assert.ok(ticketId, 'a categorised line raises a KDS ticket on the till');
+  assert.equal(cloudTicket(world.servers.cloud.dataDir, clientUuid), null, 'the cloud has nothing until the sale syncs');
+
+  const drain = () =>
+    api.edge.post('/api/edge/drain', { token: world.edge.edgeToken, body: { branch_id: branchId } });
+  const move = async (body) => {
+    const res = await api.edge.patch(`/api/queue/${ticketId}/status`, { token: world.edge.adminToken, body });
+    assert.equal(res.status, 200, `the till accepts ${body.status}: ${JSON.stringify(res.body)}`);
+    const d = await drain();
+    assert.equal(d.status, 200);
+    return d.body;
+  };
+
+  // 1. The sale replays and creates the cloud ticket at 'queue'.
+  const first = await drain();
+  assert.equal(first.body.applied, 1, 'the sale applies on the first drain');
+  assert.equal(cloudTicket(world.servers.cloud.dataDir, clientUuid).status, 'queue');
+
+  // 2. preparing — the exact transition that used to stay on the till.
+  const prep = await move({ status: 'preparing' });
+  assert.equal(prep.queueSync.applied, 1, 'the status change rides the queue lane');
+  assert.equal(cloudTicket(world.servers.cloud.dataDir, clientUuid).status, 'preparing', 'the cloud follows to preparing');
+
+  // 2b. Ticking a line done while the ticket is preparing.
+  const lineItem = (() => {
+    const db = openReplica(world.servers.edge.dataDir);
+    try {
+      return db.prepare('SELECT id FROM order_queue_items WHERE queue_id = ? ORDER BY rowid LIMIT 1').get(ticketId);
+    } finally {
+      db.close();
+    }
+  })();
+  assert.ok(lineItem, 'the ticket has at least one line');
+  const tick = await move({ status: 'preparing', item_id: lineItem.id, done: true });
+  assert.equal(tick.queueSync.applied, 1, 'a line tick also rides the queue lane');
+  assert.equal(cloudTicket(world.servers.cloud.dataDir, clientUuid).items[0].done, 1, 'the cloud line tick matches');
+
+  // 3. ready
+  await move({ status: 'ready' });
+  assert.equal(cloudTicket(world.servers.cloud.dataDir, clientUuid).status, 'ready');
+
+  // 4. completed
+  const done = await move({ status: 'completed' });
+  assert.equal(done.queueSync.applied, 1);
+  const finished = cloudTicket(world.servers.cloud.dataDir, clientUuid);
+  assert.equal(finished.status, 'completed', 'the cloud board is NOT stuck at the first stage');
+  assert.ok(finished.completed_at, 'the closing timestamp is synced');
+
+  // Exactly one cloud ticket, however many transitions happened.
+  const cdb = openReplica(world.servers.cloud.dataDir);
+  try {
+    assert.equal(cdb.prepare('SELECT COUNT(*) AS n FROM order_queue').get().n, 1, 'transitions patch, never duplicate');
+  } finally {
+    cdb.close();
+  }
+});
+
+test('a ticket completed before its sale syncs still lands as completed', async (t) => {
+  const world = await startPairedWorld();
+  t.after(() => world.stop());
+
+  const api = world.api;
+  const { branchId, prepared } = world.seeded;
+  const clientUuid = 'kds-offline-1';
+
+  await api.edge.post('/api/transactions', {
+    token: world.edge.edgeToken,
+    body: saleBody({ branchId, productId: prepared.id, quantity: 1, price: prepared.default_price, clientUuid }),
+  });
+  const ticketId = edgeTicketId(world.servers.edge.dataDir, clientUuid);
+  assert.ok(ticketId);
+
+  // Finish the ticket offline: no drain in between, so the cloud has never seen
+  // the sale. The coalesced snapshot must carry the *final* state, not the first.
+  for (const status of ['preparing', 'ready', 'completed']) {
+    const r = await api.edge.patch(`/api/queue/${ticketId}/status`, { token: world.edge.adminToken, body: { status } });
+    assert.equal(r.status, 200, `the till accepts ${status}: ${JSON.stringify(r.body)}`);
+  }
+  assert.equal(cloudTicket(world.servers.cloud.dataDir, clientUuid), null, 'the cloud still knows nothing');
+
+  const drain = await api.edge.post('/api/edge/drain', { token: world.edge.edgeToken, body: { branch_id: branchId } });
+  assert.equal(drain.body.applied, 1, 'the sale applies');
+  assert.equal(drain.body.queueSync.applied, 1, 'and its latest ticket state applies in the same drain');
+
+  const finished = cloudTicket(world.servers.cloud.dataDir, clientUuid);
+  assert.equal(finished.status, 'completed', 'the cloud goes straight to completed, not stuck at queue');
+  assert.ok(finished.completed_at, 'the closing timestamp made it too');
+});
+
+test('a cancelled ticket carries its reason to the cloud', async (t) => {
+  const world = await startPairedWorld();
+  t.after(() => world.stop());
+
+  const api = world.api;
+  const { branchId, prepared } = world.seeded;
+  const clientUuid = 'kds-cancel-1';
+
+  await api.edge.post('/api/transactions', {
+    token: world.edge.edgeToken,
+    body: saleBody({ branchId, productId: prepared.id, quantity: 1, price: prepared.default_price, clientUuid }),
+  });
+  const ticketId = edgeTicketId(world.servers.edge.dataDir, clientUuid);
+  assert.ok(ticketId);
+
+  const cancel = await api.edge.patch(`/api/queue/${ticketId}/status`, {
+    token: world.edge.adminToken,
+    body: { status: 'cancelled', reason: 'Salah input' },
+  });
+  assert.equal(cancel.status, 200, `the till accepts the cancellation: ${JSON.stringify(cancel.body)}`);
+
+  const drain = await api.edge.post('/api/edge/drain', { token: world.edge.edgeToken, body: { branch_id: branchId } });
+  assert.equal(drain.body.applied, 1, 'the sale applies');
+  assert.equal(drain.body.queueSync.applied, 1, 'the cancellation rides the queue lane');
+
+  const cancelled = cloudTicket(world.servers.cloud.dataDir, clientUuid);
+  assert.equal(cancelled.status, 'cancelled', 'the cloud board shows the cancellation');
+  assert.equal(cancelled.cancel_reason, 'Salah input', 'and its reason, for the audit trail');
+  assert.ok(cancelled.completed_at, 'a cancellation stamps a closing time');
+});
+
+
+/* -------------------------------------------------------------------------- */
+/* "On Hold" carts: the till's parked carts reach the cloud                   */
+/* -------------------------------------------------------------------------- */
+/*
+ * Regression for the second gap of the same family: parking a cart wrote
+ * `hold_orders` + a KDS ticket on the till and nothing else, because a hold is
+ * cart state, not money, and the sale replay only knows about paid transactions.
+ * The cloud's Hold list stayed empty and the ticket raised for the parked cart
+ * existed on the till alone.
+ */
+
+/** The cloud's copy of a hold (with its lines), or null when it was never mirrored. */
+function cloudHold(dataDir, holdId) {
+  const db = openReplica(dataDir);
+  try {
+    const h = db.prepare('SELECT * FROM hold_orders WHERE id = ?').get(holdId);
+    if (!h) return null;
+    h.items = db
+      .prepare('SELECT * FROM hold_order_items WHERE hold_order_id = ? ORDER BY rowid')
+      .all(holdId);
+    return h;
+  } finally {
+    db.close();
+  }
+}
+
+/** The cloud's ticket for a hold, addressed the way the sync lane addresses it. */
+function cloudHoldTicket(dataDir, holdId) {
+  const db = openReplica(dataDir);
+  try {
+    return (
+      db
+        .prepare(
+          'SELECT * FROM order_queue WHERE origin_ref = ? OR hold_order_id = ? ORDER BY rowid LIMIT 1'
+        )
+        .get(holdId, holdId) || null
+    );
+  } finally {
+    db.close();
+  }
+}
+
+/** Rows still waiting in the hold lane (0 means the till has nothing left to push). */
+function pendingHoldSync(dataDir) {
+  const db = openReplica(dataDir);
+  try {
+    // Applied rows stay behind as `synced` markers, so only `pending` means work.
+    return db.prepare("SELECT COUNT(*) AS n FROM edge_hold_sync WHERE status = 'pending'").get().n;
+  } finally {
+    db.close();
+  }
+}
+
+/** Park a cart on the till with one prepared (categorised) line. */
+function parkBody({ branchId, prepared, label = 'Meja 4', quantity = 2 }) {
+  return {
+    branch_id: branchId,
+    label,
+    items: [
+      {
+        product_id: prepared.id,
+        product_name: prepared.name,
+        price: prepared.default_price,
+        quantity,
+      },
+    ],
+  };
+}
+
+
+
+test('a parked ("On Hold") cart on the till appears on the cloud', async (t) => {
+  const world = await startPairedWorld();
+  t.after(() => world.stop());
+
+  const api = world.api;
+  const { branchId, prepared } = world.seeded;
+
+  const held = await api.edge.post('/api/holds', {
+    token: world.edge.edgeToken,
+    body: parkBody({ branchId, prepared }),
+  });
+  assert.equal(held.status, 201, `the till parks the cart: ${JSON.stringify(held.body)}`);
+  const holdId = held.body.id;
+  assert.ok(held.body.queue_id, 'parking a prepared line raises a KDS ticket on the till');
+  assert.equal(cloudHold(world.servers.cloud.dataDir, holdId), null, 'the cloud has nothing until the till drains');
+
+  const drain = await api.edge.post('/api/edge/drain', { token: world.edge.edgeToken, body: { branch_id: branchId } });
+  assert.equal(drain.status, 200, JSON.stringify(drain.body));
+  assert.equal(drain.body.holdSync.applied, 1, 'the parked cart rides its own lane');
+  assert.equal(pendingHoldSync(world.servers.edge.dataDir), 0, 'and the lane is left empty');
+
+  const mirror = cloudHold(world.servers.cloud.dataDir, holdId);
+  assert.ok(mirror, 'the cloud Hold list now has the cart');
+  assert.equal(mirror.label, 'Meja 4', 'including the label the cashier typed');
+  assert.equal(mirror.branch_id, branchId);
+  assert.equal(mirror.total, held.body.total, 'and the same total');
+  assert.equal(mirror.items.length, 1, 'with its line');
+  assert.equal(mirror.items[0].product_name, prepared.name);
+  assert.equal(mirror.items[0].quantity, 2);
+
+  const ticket = cloudHoldTicket(world.servers.cloud.dataDir, holdId);
+  assert.ok(ticket, 'the ticket raised for the parked cart exists there too');
+  assert.equal(ticket.status, 'queue', 'waiting at the station, exactly like the till');
+  assert.equal(ticket.origin_ref, holdId, 'and carries the ref later patches address it by');
+});
+
+test("a parked cart's ticket moves on the cloud board", async (t) => {
+  const world = await startPairedWorld();
+  t.after(() => world.stop());
+
+  const api = world.api;
+  const { branchId, prepared } = world.seeded;
+
+  const held = await api.edge.post('/api/holds', {
+    token: world.edge.edgeToken,
+    body: parkBody({ branchId, prepared }),
+  });
+  assert.equal(held.status, 201, JSON.stringify(held.body));
+  const holdId = held.body.id;
+  const ticketId = held.body.queue_id;
+
+  const drain = () =>
+    api.edge.post('/api/edge/drain', { token: world.edge.edgeToken, body: { branch_id: branchId } });
+  const move = async (body) => {
+    const res = await api.edge.patch(`/api/queue/${ticketId}/status`, { token: world.edge.adminToken, body });
+    assert.equal(res.status, 200, `the till accepts ${body.status}: ${JSON.stringify(res.body)}`);
+    return drain();
+  };
+
+  assert.equal((await drain()).body.holdSync.applied, 1);
+
+  // Keep it parked while the bar starts making it: the cart does not change, so
+  // only the queue lane can carry this move.
+  const prep = await move({ status: 'preparing' });
+  assert.equal(prep.body.queueSync.applied, 1, 'the move rides the queue lane');
+  const preparing = cloudHoldTicket(world.servers.cloud.dataDir, holdId);
+  assert.equal(preparing.status, 'preparing', 'the cloud board follows a hold ticket too');
+  assert.ok(preparing.started_at, 'with its start stamp');
+
+  await move({ status: 'ready' });
+  assert.equal(cloudHoldTicket(world.servers.cloud.dataDir, holdId).status, 'ready');
+
+  // Exactly one ticket on each side, however many transitions happened.
+  for (const dataDir of [world.servers.edge.dataDir, world.servers.cloud.dataDir]) {
+    const db = openReplica(dataDir);
+    try {
+      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM order_queue').get().n, 1, 'transitions patch, never duplicate');
+    } finally {
+      db.close();
+    }
+  }
+});
+
+test('resuming or discarding a parked cart clears it from the cloud', async (t) => {
+  const world = await startPairedWorld();
+  t.after(() => world.stop());
+
+  const api = world.api;
+  const { branchId, prepared } = world.seeded;
+
+  const held = await api.edge.post('/api/holds', {
+    token: world.edge.edgeToken,
+    body: parkBody({ branchId, prepared }),
+  });
+  assert.equal(held.status, 201, JSON.stringify(held.body));
+  const holdId = held.body.id;
+
+  const drain = () =>
+    api.edge.post('/api/edge/drain', { token: world.edge.edgeToken, body: { branch_id: branchId } });
+  await drain();
+  assert.ok(cloudHold(world.servers.cloud.dataDir, holdId), 'the cart is mirrored first');
+
+  // What the app does on resume: fetch the cart, drop it, rehydrate the till.
+  const resume = await api.edge.del(`/api/holds/${holdId}`, { token: world.edge.edgeToken });
+  assert.equal(resume.status, 200, JSON.stringify(resume.body));
+  assert.equal(resume.body.queue_removed, 1, 'an untouched hold ticket goes with it, as before');
+
+  const after = await drain();
+  assert.equal(after.body.holdSync.applied, 1, 'the tombstone is pushed');
+  assert.equal(cloudHold(world.servers.cloud.dataDir, holdId), null, 'and the cloud Hold list is clean again');
+  // Untouched ticket settled on the cloud too, so the bar is not sent to make a
+  // drink for a cart nobody is paying for.
+  assert.equal(cloudHoldTicket(world.servers.cloud.dataDir, holdId), null, 'no ghost ticket left on the board');
+
+  // Nothing lingers in either lane waiting to be retried.
+  assert.equal(pendingHoldSync(world.servers.edge.dataDir), 0);
+  const edgeDb = openReplica(world.servers.edge.dataDir);
+  try {
+    assert.equal(edgeDb.prepare('SELECT COUNT(*) AS n FROM edge_queue_sync').get().n, 0, 'the settled ticket snapshot is dropped');
+  } finally {
+    edgeDb.close();
+  }
+});
+
+test('a ticket the bar already started survives the cart being resumed', async (t) => {
+  const world = await startPairedWorld();
+  t.after(() => world.stop());
+
+  const api = world.api;
+  const { branchId, prepared } = world.seeded;
+
+  const held = await api.edge.post('/api/holds', {
+    token: world.edge.edgeToken,
+    body: parkBody({ branchId, prepared }),
+  });
+  const holdId = held.body.id;
+  const ticketId = held.body.queue_id;
+
+  const drain = () =>
+    api.edge.post('/api/edge/drain', { token: world.edge.edgeToken, body: { branch_id: branchId } });
+  await drain();
+
+  // The bar starts the drink while the cart is still parked…
+  const prep = await api.edge.patch(`/api/queue/${ticketId}/status`, {
+    token: world.edge.adminToken,
+    body: { status: 'preparing' },
+  });
+  assert.equal(prep.status, 200, JSON.stringify(prep.body));
+  await drain();
+  assert.equal(cloudHoldTicket(world.servers.cloud.dataDir, holdId).status, 'preparing');
+
+  // …then the cashier resumes and pays. The cart leaves the Hold list, but the work
+  // really happened, so both boards keep the ticket (and its history).
+  const resume = await api.edge.del(`/api/holds/${holdId}`, { token: world.edge.edgeToken });
+  assert.equal(resume.status, 200);
+  assert.equal(resume.body.queue_removed, 0, 'a started ticket is never deleted');
+
+  const after = await drain();
+  assert.equal(after.body.holdSync.applied, 1);
+
+  const kept = cloudHoldTicket(world.servers.cloud.dataDir, holdId);
+  assert.ok(kept, 'the started ticket stays on the cloud board');
+  assert.equal(kept.status, 'preparing', 'with the state the bar left it in');
+  assert.equal(cloudHold(world.servers.cloud.dataDir, holdId), null, 'while the cart itself is gone');
+
+  // It stays addressable: the ref outlives the hold row, so finishing the drink
+  // still reaches the cloud.
+  const done = await api.edge.patch(`/api/queue/${ticketId}/status`, {
+    token: world.edge.adminToken,
+    body: { status: 'ready' },
+  });
+  assert.equal(done.status, 200, JSON.stringify(done.body));
+  const d = await drain();
+  assert.equal(d.body.queueSync.applied, 1, 'a detached hold ticket still syncs');
+  assert.equal(cloudHoldTicket(world.servers.cloud.dataDir, holdId).status, 'ready');
+});
+
+test('editing a parked cart follows to the cloud', async (t) => {
+  const world = await startPairedWorld();
+  t.after(() => world.stop());
+
+  const api = world.api;
+  const { branchId, prepared } = world.seeded;
+
+  const held = await api.edge.post('/api/holds', {
+    token: world.edge.edgeToken,
+    body: parkBody({ branchId, prepared }),
+  });
+  assert.equal(held.status, 201, JSON.stringify(held.body));
+  const holdId = held.body.id;
+
+  const drain = () =>
+    api.edge.post('/api/edge/drain', { token: world.edge.edgeToken, body: { branch_id: branchId } });
+  await drain();
+  const first = cloudHoldTicket(world.servers.cloud.dataDir, holdId);
+  assert.ok(first, 'the ticket is mirrored first');
+
+  // The cashier adds a round while the cart sits parked.
+  const edited = await api.edge.put(`/api/holds/${holdId}`, {
+    token: world.edge.edgeToken,
+    body: {
+      items: [
+        {
+          product_id: prepared.id,
+          product_name: prepared.name,
+          price: prepared.default_price,
+          quantity: 3,
+        },
+      ],
+    },
+  });
+  assert.equal(edited.status, 200, `the till accepts the edit: ${JSON.stringify(edited.body)}`);
+
+  const after = await drain();
+  assert.equal(after.body.holdSync.applied, 1, 'the edit rides the hold lane');
+
+  const mirror = cloudHold(world.servers.cloud.dataDir, holdId);
+  assert.equal(mirror.items.length, 1);
+  assert.equal(mirror.items[0].quantity, 3, 'the cloud cart holds what the till now holds');
+  assert.equal(mirror.total, prepared.default_price * 3, 'and prices it the same');
+
+  // The station is looking at ticket #N: the edit must not renumber it, and must
+  // not leave a second ticket behind.
+  const ticket = cloudHoldTicket(world.servers.cloud.dataDir, holdId);
+  assert.equal(ticket.ticket_no, first.ticket_no, 'the ticket number stays put');
+  const db = openReplica(world.servers.cloud.dataDir);
+  try {
+    const lines = db.prepare('SELECT quantity FROM order_queue_items WHERE queue_id = ?').all(ticket.id);
+    assert.equal(lines.length, 1, 'one line, not a second copy');
+    assert.equal(lines[0].quantity, 3, 'with the edited quantity');
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM order_queue').get().n, 1, 'still exactly one ticket');
+  } finally {
+    db.close();
+  }
+});
+/* -------------------------------------------------------------------------- */
+/*
+ * Paying for a resumed cart.
+ *
+ * Parking a cart raises a real ticket, because the drinks have to be made while the
+ * customer waits. Resuming it and paying raises a *sale*, and the sale used to raise
+ * its own ticket — so an order the bar had already finished and handed over appeared
+ * on the board a second time, asking to be made again.
+ */
+/* -------------------------------------------------------------------------- */
+
+/** Every ticket on one side for the branch (both fix the same order). */
+function allTickets(dataDir, branchId) {
+  const db = openReplica(dataDir);
+  try {
+    return db.prepare('SELECT * FROM order_queue WHERE branch_id = ? ORDER BY rowid').all(branchId);
+  } finally {
+    db.close();
+  }
+}
+
+test('paying a resumed cart does not raise a second ticket', async (t) => {
+  const world = await startPairedWorld();
+  t.after(() => world.stop());
+
+  const api = world.api;
+  const { branchId, prepared } = world.seeded;
+
+  const held = await api.edge.post('/api/holds', {
+    token: world.edge.edgeToken,
+    body: parkBody({ branchId, prepared, label: 'meja 8 / deden' }),
+  });
+  assert.equal(held.status, 201, JSON.stringify(held.body));
+  const holdId = held.body.id;
+  const ticketId = held.body.queue_id;
+
+  const drain = () =>
+    api.edge.post('/api/edge/drain', { token: world.edge.edgeToken, body: { branch_id: branchId } });
+  await drain();
+  const first = cloudHoldTicket(world.servers.cloud.dataDir, holdId);
+  assert.ok(first, 'the parked cart put a ticket on the cloud board');
+
+  // The bar works it all the way through to handed over.
+  for (const status of ['preparing', 'ready', 'completed']) {
+    const moved = await api.edge.patch(`/api/queue/${ticketId}/status`, {
+      token: world.edge.adminToken,
+      body: { status },
+    });
+    assert.equal(moved.status, 200, `${status}: ${JSON.stringify(moved.body)}`);
+    await drain();
+  }
+  assert.equal(
+    cloudHoldTicket(world.servers.cloud.dataDir, holdId).status,
+    'completed',
+    'the cloud board saw it finished'
+  );
+
+  // The cashier resumes the cart — the till drops the hold — and takes the money.
+  const resume = await api.edge.del(`/api/holds/${holdId}`, { token: world.edge.edgeToken });
+  assert.equal(resume.status, 200, JSON.stringify(resume.body));
+  await drain();
+
+  const sale = await api.edge.post('/api/transactions', {
+    token: world.edge.edgeToken,
+    body: saleBody({
+      branchId,
+      productId: prepared.id,
+      quantity: 2,
+      price: prepared.default_price,
+      clientUuid: 'resume-pay-1',
+      holdId,
+    }),
+  });
+  assert.equal(sale.status, 201, JSON.stringify(sale.body));
+
+  const edgeTickets = allTickets(world.servers.edge.dataDir, branchId);
+  assert.equal(edgeTickets.length, 1, 'the till keeps one ticket, it does not add one');
+  assert.equal(edgeTickets[0].id, ticketId, 'the ticket the bar already worked');
+  assert.equal(edgeTickets[0].ticket_no, first.ticket_no, 'under the number the station knows');
+  assert.equal(edgeTickets[0].status, 'completed', 'still finished, so nothing reappears on the board');
+  assert.equal(edgeTickets[0].transaction_id, sale.body.id, 'now linked to the sale that paid for it');
+
+  const delivered = await drain();
+  assert.equal(delivered.body.applied, 1, 'the sale reaches the cloud');
+
+  const cloudTickets = allTickets(world.servers.cloud.dataDir, branchId);
+  assert.equal(cloudTickets.length, 1, 'the cloud board does not gain a duplicate either');
+  assert.equal(cloudTickets[0].ticket_no, first.ticket_no);
+  assert.equal(cloudTickets[0].status, 'completed');
+  // The cloud wrote its own transaction row for the replay, so compare against that.
+  const cloudDb = openReplica(world.servers.cloud.dataDir);
+  let cloudTxId = null;
+  try {
+    cloudTxId = cloudDb.prepare('SELECT id FROM transactions WHERE client_uuid = ?').get('resume-pay-1')?.id || null;
+  } finally {
+    cloudDb.close();
+  }
+  assert.ok(cloudTxId, 'the sale is on the cloud');
+  assert.equal(cloudTickets[0].transaction_id, cloudTxId, 'the replayed sale adopted it');
+  assert.equal(cloudTickets[0].origin_ref, holdId, 'and it is still traceable to the parked cart');
+});
+
+test('a round added while paying is added to the ticket, not raised as a new one', async (t) => {
+  const world = await startPairedWorld();
+  t.after(() => world.stop());
+
+  const api = world.api;
+  const { branchId, prepared } = world.seeded;
+
+  const held = await api.edge.post('/api/holds', {
+    token: world.edge.edgeToken,
+    body: parkBody({ branchId, prepared, label: 'meja 9', quantity: 2 }),
+  });
+  const holdId = held.body.id;
+  const ticketId = held.body.queue_id;
+
+  const drain = () =>
+    api.edge.post('/api/edge/drain', { token: world.edge.edgeToken, body: { branch_id: branchId } });
+  await drain();
+
+  for (const status of ['preparing', 'ready', 'completed']) {
+    await api.edge.patch(`/api/queue/${ticketId}/status`, { token: world.edge.adminToken, body: { status } });
+    await drain();
+  }
+  const first = cloudHoldTicket(world.servers.cloud.dataDir, holdId);
+
+  await api.edge.del(`/api/holds/${holdId}`, { token: world.edge.edgeToken });
+  await drain();
+
+  // The customer orders one more of the same drink while paying.
+  const sale = await api.edge.post('/api/transactions', {
+    token: world.edge.edgeToken,
+    body: saleBody({
+      branchId,
+      productId: prepared.id,
+      quantity: 3,
+      price: prepared.default_price,
+      clientUuid: 'resume-pay-2',
+      holdId,
+    }),
+  });
+  assert.equal(sale.status, 201, JSON.stringify(sale.body));
+
+  /** The order's lines, as the station sees them. */
+  const lines = (dataDir, queueId) => {
+    const db = openReplica(dataDir);
+    try {
+      return db.prepare('SELECT * FROM order_queue_items WHERE queue_id = ? ORDER BY rowid').all(queueId);
+    } finally {
+      db.close();
+    }
+  };
+
+  const tillLines = lines(world.servers.edge.dataDir, ticketId);
+  assert.equal(tillLines.length, 1, 'the extra cup lands on the existing line');
+  assert.equal(tillLines[0].quantity, 3, 'made twice, plus the one ordered at the counter');
+
+  await drain();
+  const cloudTickets = allTickets(world.servers.cloud.dataDir, branchId);
+  assert.equal(cloudTickets.length, 1, 'still a single ticket on the cloud');
+  assert.equal(cloudTickets[0].ticket_no, first.ticket_no);
+  const cloudLines = lines(world.servers.cloud.dataDir, cloudTickets[0].id);
+  assert.equal(cloudLines.length, 1);
+  assert.equal(cloudLines[0].quantity, 3, 'and the cloud board shows the same round');
+});
+
 
 

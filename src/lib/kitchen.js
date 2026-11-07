@@ -1,5 +1,7 @@
 import { db } from '../db.js';
+import { isEdge } from '../edge.js';
 import { id, toIso } from './helpers.js';
+import { enqueueQueueSnapshot } from './edgeQueueSync.js';
 
 /**
  * Kitchen / barista display (KDS) queue.
@@ -138,6 +140,7 @@ export function createTicket({
   userId = null,
   transactionId = null,
   holdOrderId = null,
+  originRef = null,
   orderLabel = null,
   tableNumber = null,
   customerName = null,
@@ -164,11 +167,11 @@ export function createTicket({
   const queueId = id();
   const run = db.transaction(() => {
     db.prepare(
-      `INSERT INTO order_queue (id, company_id, branch_id, transaction_id, hold_order_id, ticket_no, order_label, table_number,
+      `INSERT INTO order_queue (id, company_id, branch_id, transaction_id, hold_order_id, origin_ref, ticket_no, order_label, table_number,
          customer_name, station, status, note, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queue', ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queue', ?, ?)`
     ).run(
-      queueId, companyId, branchId, transactionId, holdOrderId, nextTicketNo(branchId), orderLabel, tableNumber,
+      queueId, companyId, branchId, transactionId, holdOrderId, originRef, nextTicketNo(branchId), orderLabel, tableNumber,
       customerName, resolvedStation, note, userId
     );
     const stmt = db.prepare(
@@ -194,13 +197,18 @@ export function createTicket({
  *
  * Returns the new queue id, or null when the hold has nothing to prepare.
  */
-export function enqueueFromHold({ companyId, branchId, userId, holdId, hold, items = [] }) {
+/**
+ * The lines of a parked cart that the station actually has to make.
+ *
+ * Same `isPreparedItem` filter a paid sale uses, so retail lines never reach the
+ * bar. A custom line with no product link has no category to route on, but it is
+ * still something the counter asked for — keep it, as a waiter ticket would.
+ */
+function preparedHoldLines(items = []) {
   const prodStmt = db.prepare('SELECT category_id, is_variant_parent FROM products WHERE id = ?');
-  const lines = (items || [])
+  return (items || [])
     .filter((i) => {
       if (!i || !(i.product_name || i.product_id)) return false;
-      // A custom line with no product link has no category to route on, but it is
-      // still something the counter asked for — keep it, as a waiter ticket would.
       if (!i.product_id) return true;
       return isPreparedItem(prodStmt.get(i.product_id));
     })
@@ -211,6 +219,49 @@ export function enqueueFromHold({ companyId, branchId, userId, holdId, hold, ite
       quantity: Number(i.quantity) || 1,
       note: i.note || null
     }));
+}
+
+/**
+ * Rewrite a still-untouched ticket's lines from the cart's current contents.
+ *
+ * Editing a parked cart re-raises its ticket on the till, so the mirrored copy has
+ * to follow — but ticket ids are local to each side, so the record cannot simply be
+ * replaced. Rewriting the lines in place keeps the number the bar is already looking
+ * at. Idempotent by construction: identical input leaves the identical end state,
+ * which matters because a snapshot is replayed whenever a response is lost.
+ *
+ * Returns the number of tickets touched (0 when the hold has no ticket).
+ */
+export function replaceHoldTicketLines({ companyId, holdId, items = [] }) {
+  const row = db
+    .prepare(
+      `SELECT id, status FROM order_queue
+        WHERE company_id = ? AND transaction_id IS NULL AND (origin_ref = ? OR hold_order_id = ?)
+        ORDER BY rowid LIMIT 1`
+    )
+    .get(companyId, holdId, holdId);
+  if (!row) return 0;
+  // Once the bar has started, the original ticket is the record of what was
+  // actually made — rewriting it would falsify that history (same rule as the till).
+  if (row.status !== 'queue') return 0;
+
+  const lines = preparedHoldLines(items);
+  if (!lines.length) return 0;
+  const run = db.transaction(() => {
+    db.prepare('DELETE FROM order_queue_items WHERE queue_id = ?').run(row.id);
+    const stmt = db.prepare(
+      'INSERT INTO order_queue_items (id, queue_id, product_id, product_name, variant_label, quantity, note) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    );
+    for (const l of lines) {
+      stmt.run(id(), row.id, l.product_id, l.product_name, l.variant_label, l.quantity, l.note);
+    }
+  });
+  run();
+  return 1;
+}
+
+export function enqueueFromHold({ companyId, branchId, userId, holdId, hold, items = [] }) {
+  const lines = preparedHoldLines(items);
   if (!lines.length) return null;
 
   const queueId = createTicket({
@@ -218,6 +269,10 @@ export function enqueueFromHold({ companyId, branchId, userId, holdId, hold, ite
     branchId,
     userId,
     holdOrderId: holdId,
+    // The cross-side identity for this ticket: the hold id. The cloud raises the
+    // ticket from the mirrored hold and stamps the same ref, so later status moves
+    // can still address it once the hold row is gone.
+    originRef: holdId,
     orderLabel: hold.label || null,
     tableNumber: hold.table_number || null,
     customerName: hold.customer_name || null,
@@ -253,13 +308,105 @@ export function settleHoldTicket({ companyId, holdId }) {
 }
 
 /**
+ * Take over the ticket a parked cart already raised, instead of raising a second one.
+ *
+ * Parking a cart raises a real ticket, because the drinks have to be made while the
+ * customer is still at the table. When the cart is resumed and finally paid, the sale
+ * must *continue* that ticket: raising a fresh one tells the bar to make an order it
+ * has already finished and handed over.
+ *
+ * The ticket is found by `origin_ref` — the hold id, which survives the hold row being
+ * deleted on resume (the foreign key is nulled, the ref is not) and is mirrored to the
+ * cloud by the hold lane, so the same ticket exists on both sides.
+ *
+ * Lines the sale has that the ticket does not (a drink added at the counter while
+ * paying) are added, so nothing goes un-made: more of a drink already on the ticket
+ * bumps that line's quantity, an entirely new item becomes a new line. Matching is by
+ * product + variant + note, because "less ice" is a different cup. Quantities already
+ * on the ticket are never reduced — they were produced.
+ *
+ * A cancelled ticket is not adopted: the bar refused that order, and a sale that pays
+ * for it needs a ticket somebody will actually work.
+ *
+ * Returns the adopted queue id, or null when there is nothing to adopt.
+ */
+export function adoptHoldTicket({ companyId, branchId, transactionId, holdId, prepared = [] }) {
+  if (!companyId || !branchId || !transactionId || !holdId) return null;
+  const ticket = db
+    .prepare(
+      `SELECT * FROM order_queue
+        WHERE company_id = ? AND branch_id = ? AND transaction_id IS NULL AND status <> 'cancelled'
+          AND (origin_ref = ? OR hold_order_id = ?)
+        ORDER BY rowid DESC LIMIT 1`
+    )
+    .get(companyId, branchId, holdId, holdId);
+  if (!ticket) return null;
+
+  const sameLine = (line, p) =>
+    (line.product_id || '') === (p.prod.id || '') &&
+    (line.variant_label || '') === (p.variantLabel || '') &&
+    (line.note || '') === (p.note || '');
+
+  const lines = db.prepare('SELECT * FROM order_queue_items WHERE queue_id = ? ORDER BY rowid').all(ticket.id);
+  // How much of each line the sale is already covered by, consumed as we go.
+  const remaining = lines.map((l) => Number(l.quantity) || 0);
+  const bumps = [];
+  const additions = [];
+
+  for (const p of prepared) {
+    let want = Number(p.qty) || 1;
+    let firstMatch = -1;
+    for (let i = 0; i < lines.length && want > 0; i += 1) {
+      if (!sameLine(lines[i], p)) continue;
+      if (firstMatch < 0) firstMatch = i;
+      if (remaining[i] <= 0) continue;
+      const taken = Math.min(remaining[i], want);
+      remaining[i] -= taken;
+      want -= taken;
+    }
+    if (want <= 0) continue;
+    if (firstMatch >= 0) {
+      bumps.push({ itemId: lines[firstMatch].id, add: want });
+    } else {
+      additions.push({
+        product_id: p.prod.id,
+        product_name: p.prod.name,
+        variant_label: p.variantLabel || null,
+        quantity: want,
+        note: p.note || null
+      });
+    }
+  }
+
+  const run = db.transaction(() => {
+    // Keep ticket_no, status and timestamps: the station's copy of the order is the
+    // record of what was actually made, and the cashier paid for exactly that.
+    db.prepare('UPDATE order_queue SET transaction_id = ?, hold_order_id = NULL WHERE id = ?').run(transactionId, ticket.id);
+    const bump = db.prepare('UPDATE order_queue_items SET quantity = quantity + ? WHERE id = ?');
+    for (const b of bumps) bump.run(b.add, b.itemId);
+    const insert = db.prepare(
+      'INSERT INTO order_queue_items (id, queue_id, product_id, product_name, variant_label, quantity, note) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    );
+    for (const a of additions) insert.run(id(), ticket.id, a.product_id, a.product_name, a.variant_label, a.quantity, a.note);
+  });
+  run();
+  return ticket.id;
+}
+
+/**
  * Enqueue the prepared lines of a committed sale. Called from the checkout path
  * so every channel (till, offline replay, waiter) produces a ticket.
- * Returns the new queue id, or null when the sale had nothing to prepare.
+ *
+ * `holdId` is set when the sale pays for a cart that was parked earlier: the sale
+ * adopts that cart's ticket instead of raising a duplicate (see `adoptHoldTicket`).
+ *
+ * Returns the queue id, or null when the sale had nothing to prepare.
  */
-export function enqueueFromTransaction({ companyId, branchId, userId, transactionId, transaction, prepared }) {
+export function enqueueFromTransaction({ companyId, branchId, userId, transactionId, transaction, prepared, holdId = null }) {
   const lines = (prepared || []).filter((p) => isPreparedItem(p.prod));
   if (!lines.length) return null;
+  const adopted = adoptHoldTicket({ companyId, branchId, transactionId, holdId, prepared: lines });
+  if (adopted) return adopted;
   return createTicket({
     companyId,
     branchId,
@@ -276,6 +423,54 @@ export function enqueueFromTransaction({ companyId, branchId, userId, transactio
       quantity: p.qty,
       note: p.note || null
     }))
+  });
+}
+
+/**
+ * Fold a ticket's new state into the edge→cloud queue lane.
+ *
+ * The lane needs a key that exists on both sides. Two kinds of ticket have one:
+ *
+ *   sale  — `transactions.client_uuid`, the id the sale replay already dedupes on.
+ *   hold  — `order_queue.origin_ref` (the till's hold id). The ticket was raised
+ *           from a parked cart, which the hold lane mirrored, so the cloud has the
+ *           same ticket under the same ref.
+ *
+ * A walk-in ticket (no sale, no hold) has neither: it was never sent anywhere, so
+ * there is nothing on the cloud to patch and it stays local by design.
+ *
+ * `items_done` is positional — both sides created the lines from the same
+ * `prepared`/hold lines, in the same order.
+ */
+function queueSyncAfterMutation(row, updated) {
+  if (!isEdge()) return;
+  let originUuid = null;
+  let kind = 'sale';
+
+  if (row.transaction_id) {
+    const tx = db.prepare('SELECT client_uuid FROM transactions WHERE id = ?').get(row.transaction_id);
+    if (!tx || !tx.client_uuid) return;
+    originUuid = tx.client_uuid;
+  } else {
+    // `origin_ref` survives the hold being resumed and deleted; `hold_order_id`
+    // is only there for a ticket raised before this column existed.
+    originUuid = updated?.origin_ref || row.origin_ref || row.hold_order_id || null;
+    if (!originUuid) return;
+    kind = 'hold';
+  }
+
+  enqueueQueueSnapshot({
+    originUuid,
+    branchId: row.branch_id,
+    payload: {
+      kind,
+      status: updated.status,
+      started_at: updated.started_at,
+      ready_at: updated.ready_at,
+      completed_at: updated.completed_at,
+      cancel_reason: updated.cancel_reason,
+      items_done: (updated.items || []).map((i) => (i.done ? 1 : 0)),
+    },
   });
 }
 
@@ -326,7 +521,9 @@ export function setStatus({ queueId, companyId, userId, status, reason = null, l
     db.prepare(`UPDATE order_queue SET ${sets.join(', ')} WHERE id = ?`).run(...vals, row.id);
   });
   run();
-  return { row: getQueueItem(row.id, companyId) };
+  const updated = getQueueItem(row.id, companyId);
+  queueSyncAfterMutation(row, updated);
+  return { row: updated };
 }
 
 /** Hard-delete a ticket (mistakes only — normal completion keeps history). */

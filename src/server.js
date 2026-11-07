@@ -6,6 +6,7 @@ import morgan from 'morgan';
 import { initSchema, db, DATA_DIR } from './db.js';
 import { isEdge, EDGE_HOST, edgeCorsOptions, localSecret } from './edge.js';
 import { startUpstreamWorker } from './lib/edgeOutbox.js';
+import { backfillHolds } from './lib/edgeHoldSync.js';
 
 import authRoutes, { registrationState } from './routes/auth.routes.js';
 import orgRoutes from './routes/org.routes.js';
@@ -24,6 +25,7 @@ import docsRoutes from './routes/docs.routes.js';
 import settingsRoutes from './routes/settings.routes.js';
 import backupRoutes from './routes/backup.routes.js';
 import edgeRoutes, { upstreamUrl } from './routes/edge.routes.js';
+import { upstreamRequest } from './lib/edgeUpstream.js';
 
 initSchema();
 
@@ -191,6 +193,9 @@ if (process.env.NODE_ENV !== 'test') {
   const stopWorker = EDGE ? startDrainWorker() : null;
 
   function startDrainWorker() {
+    // Carts parked before the hold lane existed were never queued for the cloud;
+    // pick them up once so an upgrade mid-shift does not strand them.
+    backfillHolds();
     return startUpstreamWorker({
       branchIds: () => {
         const ids = new Set();
@@ -199,32 +204,18 @@ if (process.env.NODE_ENV !== 'test') {
         for (const r of db.prepare("SELECT DISTINCT branch_id FROM edge_outbox WHERE status = 'pending'").all()) {
           if (r.branch_id) ids.add(r.branch_id);
         }
+        // Ticket status changes ride a second lane; a branch with one still needs the
+        // worker to run even when no sale is pending.
+        for (const r of db.prepare("SELECT DISTINCT branch_id FROM edge_queue_sync WHERE status = 'pending'").all()) {
+          if (r.branch_id) ids.add(r.branch_id);
+        }
+        // Same for parked ("On Hold") carts: they were never in the sale outbox.
+        for (const r of db.prepare("SELECT DISTINCT branch_id FROM edge_hold_sync WHERE status = 'pending'").all()) {
+          if (r.branch_id) ids.add(r.branch_id);
+        }
         return [...ids];
       },
-      post: async (path, body) => {
-        const upstream = upstreamUrl();
-        if (!upstream) throw new Error('Server pusat belum diatur');
-        // The drain runs without a user on screen, so it authenticates with the
-        // device token minted at the last successful login.
-        const token = db.prepare("SELECT value FROM settings WHERE key = 'edge_device_token'").get();
-        const r = await fetch(`${upstream}${path}`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(token && token.value ? { Authorization: `Bearer ${token.value}` } : {}),
-          },
-          body: JSON.stringify(body),
-        });
-        const text = await r.text();
-        let data = null;
-        try {
-          data = text ? JSON.parse(text) : null;
-        } catch {
-          data = null;
-        }
-        if (!r.ok) throw new Error((data && data.error) || `Server pusat menolak (${r.status})`);
-        return data;
-      },
+      post: async (path, body) => upstreamRequest(path, { method: 'POST', body }),
       onTick: (branchId, res) => {
         if (res.applied) console.log(`POS edge synced branch=${branchId} applied=${res.applied}`);
       },

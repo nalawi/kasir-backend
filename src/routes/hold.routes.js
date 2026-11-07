@@ -3,6 +3,7 @@ import { db } from '../db.js';
 import { authRequired, audit, assertBranchAccess } from '../auth.js';
 import { id, wrap, badRequest, notFound, money } from '../lib/helpers.js';
 import { enqueueFromHold, settleHoldTicket } from '../lib/kitchen.js';
+import { holdSyncAfterMutation } from '../lib/edgeHoldSync.js';
 
 const router = express.Router();
 
@@ -98,6 +99,11 @@ router.post('/holds', authRequired, wrap((req, res) => {
     audit({ company_id: req.user.company_id, branch_id, user_id: req.user.sub, action: 'queue.create', entity: 'order_queue', entity_id: queueId, detail: { source: 'hold', items: prepared.length }, ip: req.ip });
   }
 
+  // Mirror the parked cart (and its ticket) to the cloud. Best-effort and last, so
+  // a sync hiccup can never cost the cashier a parked cart — the same guarantee the
+  // kitchen ticket above gives.
+  holdSyncAfterMutation({ holdId: hid, branchId: branch_id });
+
   res.status(201).json({ ...loadHold(hid, req.user.company_id), queue_id: queueId });
 }));
 
@@ -154,6 +160,10 @@ router.put('/holds/:id', authRequired, wrap((req, res) => {
     // Non-fatal: the cart edit is already committed.
   }
 
+  // The cart and its ticket have both changed; send the new absolute state so the
+  // cloud's Hold list and board show what the cashier now has parked.
+  holdSyncAfterMutation({ holdId: h.id, branchId: h.branch_id });
+
   res.json(loadHold(h.id, req.user.company_id));
 }));
 
@@ -168,6 +178,12 @@ router.delete('/holds/:id', authRequired, wrap((req, res) => {
   const h = loadHold(req.params.id, req.user.company_id);
   if (!h) return notFound(res, 'Hold order not found');
   if (!assertBranchAccess(req, res, h.branch_id)) return;
+
+  // Tombstone first, while the rows still exist: the cloud settles the hold and its
+  // ticket in one shot, so the payload has to carry the ticket's last state. Without
+  // this the card would linger on the cloud's Hold list after the cart was resumed
+  // into a sale — the ghost order the cashier cannot get rid of.
+  holdSyncAfterMutation({ holdId: h.id, branchId: h.branch_id, deleted: true });
 
   let queueRemoved = 0;
   if (!req.query.keep_queue) {

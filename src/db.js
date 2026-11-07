@@ -265,6 +265,11 @@ export function initSchema() {
     branch_id TEXT NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
     transaction_id TEXT REFERENCES transactions(id) ON DELETE SET NULL,
     hold_order_id TEXT REFERENCES hold_orders(id) ON DELETE SET NULL,
+    -- Cross-side identity for a ticket that has no sale behind it (a hold ticket).
+    -- It is the till's hold id, so the edge can keep patching this ticket on the
+    -- cloud even after the hold row is gone (resumed into a sale) and the foreign
+    -- key above has been nulled.
+    origin_ref TEXT,
     ticket_no INTEGER,
     order_label TEXT,
     table_number TEXT,
@@ -329,6 +334,53 @@ export function initSchema() {
     updated_at TEXT DEFAULT (datetime('now'))
   );
 
+  -- Edge mode only: the latest known state of each kitchen ticket, waiting to be
+  -- pushed to the cloud. The sale itself syncs through edge_outbox, but that lane
+  -- is terminal once the cloud says "applied" — it never revisits a ticket. Every
+  -- later status change (preparing/ready/completed/cancelled), cancel reason and
+  -- per-line "done" tick is folded into ONE row per ticket here and drained after
+  -- the sale lane, so the cloud board reflects what the bar is actually doing.
+  --
+  -- origin_uuid is transactions.client_uuid: the same id the sale replay dedupes
+  -- on, which already exists on both sides (so no new column on order_queue and no
+  -- fan-out duplicates). The revision counter is bumped on every change so a drain
+  -- only clears the row it actually sent — a tap that happens mid-flight is resent
+  -- next tick instead of being swallowed.
+  CREATE TABLE IF NOT EXISTS edge_queue_sync (
+    origin_uuid TEXT PRIMARY KEY,           -- transactions.client_uuid
+    branch_id TEXT NOT NULL,
+    payload TEXT NOT NULL,                  -- latest absolute ticket snapshot
+    revision INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending', -- pending | synced
+    attempts INTEGER DEFAULT 0,
+    last_error TEXT,
+    next_attempt_at TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+  );
+
+  -- Edge mode only: parked ("On Hold") carts waiting to be mirrored to the cloud.
+  -- A hold is pure cart state — no money moves — so it has no client_uuid and did
+  -- not travel with the sale replay at all: the cloud's Hold list stayed empty and
+  -- the kitchen ticket raised for it never existed there. One row per hold carries
+  -- the whole absolute cart (header + lines + the ticket's current state), drained
+  -- before the queue lane so the cloud ticket exists before it is patched.
+  --
+  -- hold_id is the till's own hold id, replayed verbatim, so updates and the
+  -- tombstone written when the cart is resumed or discarded address the same row.
+  CREATE TABLE IF NOT EXISTS edge_hold_sync (
+    hold_id TEXT PRIMARY KEY,               -- hold_orders.id, mirrored as-is
+    branch_id TEXT NOT NULL,
+    payload TEXT NOT NULL,                  -- latest absolute hold snapshot (or tombstone)
+    revision INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending', -- pending | synced
+    attempts INTEGER DEFAULT 0,
+    last_error TEXT,
+    next_attempt_at TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+  );
+
   -- Edge mode only: rate limiting for the offline PIN unlock. Mirrors the cloud's
   -- login_attempts so a till cannot be brute-forced faster just because it is
   -- dialled back to the local service.
@@ -361,6 +413,8 @@ export function initSchema() {
   CREATE INDEX IF NOT EXISTS idx_queue_branch ON order_queue(branch_id, status, created_at);
   CREATE INDEX IF NOT EXISTS idx_queue_tx ON order_queue(transaction_id);
   CREATE INDEX IF NOT EXISTS idx_queue_items ON order_queue_items(queue_id);
+  CREATE INDEX IF NOT EXISTS idx_edge_queue_sync_branch ON edge_queue_sync(branch_id, status);
+  CREATE INDEX IF NOT EXISTS idx_edge_hold_sync_branch ON edge_hold_sync(branch_id, status);
   CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id);
   CREATE INDEX IF NOT EXISTS idx_attempts_identifier ON login_attempts(identifier, created_at);
   CREATE INDEX IF NOT EXISTS idx_audit_company ON audit_logs(company_id, created_at);
@@ -436,7 +490,7 @@ const MIGRATIONS = {
   shifts: [['note', 'TEXT'], ['cash_sales', 'REAL DEFAULT 0'], ['non_cash_sales', 'REAL DEFAULT 0']],
   devices: [['app_version', 'TEXT'], ['platform', 'TEXT'], ['device_key', 'TEXT'], ['revoked_reason', 'TEXT']],
   stock_transfers: [['rejected_reason', 'TEXT']],
-  order_queue: [['hold_order_id', 'TEXT']],
+  order_queue: [['hold_order_id', 'TEXT'], ['origin_ref', 'TEXT']],
   companies: [['currency', "TEXT DEFAULT 'IDR'"], ['timezone', "TEXT DEFAULT 'Asia/Jakarta'"], ['tax_percent', 'REAL DEFAULT 0'], ['logo_url', 'TEXT']],
   roles: [['description', 'TEXT'], ['updated_at', 'TEXT']]
 };
@@ -457,4 +511,7 @@ function migrate() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_tx_client_uuid ON transactions(client_uuid);');
   db.exec('CREATE INDEX IF NOT EXISTS idx_outbox_status ON edge_outbox(branch_id, status);');
   db.exec('CREATE INDEX IF NOT EXISTS idx_edge_attempts ON edge_login_attempts(user_id, created_at);');
+  // Indexed here, not with the schema above: `origin_ref` only exists after the
+  // ALTER TABLE loop for databases created by an earlier version.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_queue_origin_ref ON order_queue(origin_ref);');
 }

@@ -207,6 +207,8 @@ export function persistTransaction({ companyId, branchId, userId, deviceId, clie
 
   // Send the drinks/food to the kitchen display. Best-effort: a queue failure
   // must never roll back a paid sale, so it is outside the transaction above.
+  // `hold_id` (a resumed parked cart) makes the sale adopt that cart's ticket
+  // instead of asking the bar to make the same order twice.
   let queueId = null;
   try {
     queueId = enqueueFromTransaction({
@@ -214,6 +216,7 @@ export function persistTransaction({ companyId, branchId, userId, deviceId, clie
       branchId,
       userId,
       transactionId: txId,
+      holdId: client.hold_id || null,
       transaction: {
         order_label: client.order_label,
         table_number: client.table_number,

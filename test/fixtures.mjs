@@ -48,6 +48,30 @@ export async function seedCloud(api) {
     products.push({ ...p, id: productId });
   }
 
+  // One *categorised* product, on purpose. `isPreparedItem` routes categorised
+  // lines to the kitchen display, so only a sale of this item creates an
+  // `order_queue` ticket. Keeping it separate from the retail lines above means the
+  // existing sale-based tests still produce no ticket, while KDS tests have one.
+  const cat = await api.cloud.post('/api/categories', { token, body: { name: 'Minuman' } });
+  if (cat.status >= 300) throw new Error(`category failed: ${JSON.stringify(cat.body)}`);
+  const preparedProd = await api.cloud.post('/api/products', {
+    token,
+    body: { name: 'Es Kopi Susu', default_price: 20000, category_id: cat.body.id },
+  });
+  if (preparedProd.status >= 300) throw new Error(`prepared product failed: ${JSON.stringify(preparedProd.body)}`);
+  const prepAdj = await api.cloud.post(`/api/branches/${branchId}/stock/adjust`, {
+    token,
+    body: { product_id: preparedProd.body.id, quantity: 30, type: 'set' },
+  });
+  if (prepAdj.status >= 300) throw new Error(`prepared stock failed: ${JSON.stringify(prepAdj.body)}`);
+  const prepared = {
+    name: 'Es Kopi Susu',
+    default_price: 20000,
+    category_id: cat.body.id,
+    id: preparedProd.body.id,
+  };
+  products.push(prepared);
+
   const cashierEmail = 'budi@uji.id';
   const cashierPassword = 'rahasia123';
   const cashier = await api.cloud.post('/api/users', {
@@ -57,7 +81,7 @@ export async function seedCloud(api) {
   const cashierId = cashier.body.id || cashier.body.user?.id;
   await api.cloud.put(`/api/users/${cashierId}`, { token, body: { pin: CASHIER_PIN } });
 
-  return { token, branchId, products, cashierId, cashierEmail, cashierPassword };
+  return { token, branchId, products, prepared, cashierId, cashierEmail, cashierPassword };
 }
 
 /**
@@ -136,13 +160,15 @@ export async function startPairedWorld() {
 }
 
 /** Build a checkout body for one product line. */
-export function saleBody({ branchId, productId, quantity, price, clientUuid, cashReceived = 100000 }) {
+export function saleBody({ branchId, productId, quantity, price, clientUuid, cashReceived = 100000, holdId = null }) {
   return {
     branch_id: branchId,
     client_uuid: clientUuid,
     items: [{ product_id: productId, quantity, price }],
     payment_method: 'cash',
     cash_received: cashReceived,
+    // Present only when the cart was resumed from "On Hold".
+    ...(holdId ? { hold_id: holdId } : {}),
   };
 }
 
