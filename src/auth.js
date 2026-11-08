@@ -68,11 +68,19 @@ export function revokeAllUserTokens(userId) {
 
 /* ------------------------- rate limiting -------------------------- */
 
+/**
+ * The window boundary has to be produced by SQLite, not by `toISOString()`:
+ * `created_at` is `datetime('now')` text (`YYYY-MM-DD HH:MM:SS`), and an ISO string
+ * sorts *after* every such value on the same date (`' '` < `'T'`), so comparing
+ * against one silently matched nothing and the lockout never fired. Same idiom as
+ * the PIN lockout in `edge.routes.js`.
+ */
 export function isLocked(identifier) {
-  const since = new Date(Date.now() - WINDOW_MINUTES * 60_000).toISOString();
   const fails = db
-    .prepare('SELECT COUNT(*) AS n FROM login_attempts WHERE identifier = ? AND success = 0 AND created_at >= ?')
-    .get(String(identifier || '').toLowerCase(), since).n;
+    .prepare(
+      "SELECT COUNT(*) AS n FROM login_attempts WHERE identifier = ? AND success = 0 AND created_at >= datetime('now', ?)"
+    )
+    .get(String(identifier || '').toLowerCase(), `-${WINDOW_MINUTES} minutes`).n;
   return fails >= MAX_FAILS;
 }
 
