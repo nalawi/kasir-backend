@@ -71,14 +71,21 @@ export function applyBootstrap({ snapshot, users = [], branchId }) {
        ON CONFLICT(id) DO UPDATE SET name = excluded.name`
     ).run(branchRow, companyId, branch.name || 'Cabang', branch.address ?? null, branch.phone ?? null);
 
+    // `cost_price` is replicated alongside the selling price. It is not decoration:
+    // `createTransaction` stamps each line's `cost_price` from the product row, and
+    // every report on this till (profit, COGS, stock value) sums those columns. The
+    // snapshot used to carry only the selling price, so a bootstrapped till sold at
+    // the right price and reported a 100 % margin — numbers that disagreed with the
+    // cloud for the same day's sales.
     const upsertProduct = db.prepare(
       `INSERT INTO products (id, company_id, name, sku, barcode, category_id, unit, image_url,
-                             default_price, is_active, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                             cost_price, default_price, is_active, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
        ON CONFLICT(id) DO UPDATE SET
          name = excluded.name, sku = excluded.sku, barcode = excluded.barcode,
          category_id = excluded.category_id, unit = excluded.unit,
-         image_url = excluded.image_url, default_price = excluded.default_price,
+         image_url = excluded.image_url, cost_price = excluded.cost_price,
+         default_price = excluded.default_price,
          is_active = 1`
     );
 
@@ -149,6 +156,10 @@ export function applyBootstrap({ snapshot, users = [], branchId }) {
       upsertProduct.run(
         p.id, companyId, p.name, p.sku ?? null, p.barcode ?? null,
         p.category_id ?? null, p.unit ?? null, p.image_url ?? null,
+        // A snapshot from a service that predates the column omits it; write 0
+        // rather than NULL, which is the value the till used to produce anyway and
+        // keeps the report arithmetic (`SUM(cost_price * quantity)`) numeric.
+        Number(p.cost_price) || 0,
         p.price, nowIso()
       );
       // The row id must include the branch. `id` is the PRIMARY KEY, so a
@@ -199,6 +210,31 @@ export function applyBootstrap({ snapshot, users = [], branchId }) {
       }
     }
 
+    // Sales rung up while the replica had no cost were stamped `cost_price = 0`
+    // (that is what `createTransaction` copies off the product row), and the profit
+    // report sums exactly that column. Fixing the catalog alone would leave every
+    // sale made before this bootstrap reporting a 100 % margin forever, so repair
+    // the lines that carry no cost now that the replica finally knows one.
+    //
+    // Deliberately narrow: only lines whose cost is absent (`0`/NULL), only for
+    // products this snapshot prices above zero (a genuine giveaway item keeps its
+    // zero), only inside the company this snapshot belongs to (a re-paired till may
+    // still hold another tenant's history), and only once — after this the guard no
+    // longer matches. Costs are not versioned per line, so the current cost is the
+    // best available approximation; it is strictly closer to the cloud's figure than
+    // the zero it replaces.
+    const costsFixed = db
+      .prepare(
+        `UPDATE transaction_items
+            SET cost_price = (SELECT p.cost_price FROM products p WHERE p.id = transaction_items.product_id)
+          WHERE (transaction_items.cost_price IS NULL OR transaction_items.cost_price = 0)
+            AND transaction_items.product_id IS NOT NULL
+            AND EXISTS (SELECT 1 FROM products p
+                         WHERE p.id = transaction_items.product_id AND p.cost_price > 0)
+            AND EXISTS (SELECT 1 FROM transactions t
+                         WHERE t.id = transaction_items.transaction_id AND t.company_id = ?)`
+      )
+      .run(companyId).changes;
 
     // Hide products the cloud no longer sells at this branch. Deleting would
     // orphan the sales history that points at them.
@@ -355,6 +391,11 @@ export function applyBootstrap({ snapshot, users = [], branchId }) {
       // between "the roster came over" and "the roster can actually do its job":
       // with 6 users and 0 roles, everybody on a custom role is locked out.
       roles: roleCount,
+      // Past sale lines that had no cost and now carry the product's. Reported
+      // separately from `products` because it is history being repaired, not the
+      // catalog being copied, and a shop checking why yesterday's margin moved
+      // deserves to see it counted.
+      costs_fixed: costsFixed,
       synced_at: snapshot.synced_at || nowIso(),
     };
   });

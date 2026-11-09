@@ -1723,4 +1723,107 @@ test('a round added while paying is added to the ticket, not raised as a new one
 });
 
 
+/* -------------------------------------------------------------------------- */
+/* Cost price: the column the edge's reports are computed from                */
+/* -------------------------------------------------------------------------- */
+/*
+ * Regression: the snapshot shipped the selling price and nothing else, and
+ * `applyBootstrap` wrote the product row without a cost. A bootstrapped till
+ * therefore sold at the right price and reported *zero* cost of goods, so
+ * "Laba" on the till disagreed with the cloud for the very same sales — the one
+ * comparison an owner makes by hand. `createTransaction` stamps each line's
+ * `cost_price` from the product row, which is why both the catalog pull and the
+ * already-written lines have to be repaired, not just one of them.
+ *
+ * The parity suites cannot see this: they create their products through HTTP on
+ * each server, so both sides have the cost without ever replicating it.
+ */
+test('cost price replicates, and the till report agrees with the cloud', async (t) => {
+  const world = await startPairedWorld();
+  t.after(() => world.stop());
+
+  const api = world.api;
+  const { branchId, products } = world.seeded;
+  const kopi = products.find((p) => p.name === 'Kopi Susu');
+  const unitPrice = kopi.default_price;
+
+  // A sale rung up while the replica did not know the product's cost — the shape
+  // of every sale made before this fix.
+  const oldSale = await api.edge.post('/api/transactions', {
+    token: world.edge.edgeToken,
+    body: saleBody({
+      branchId,
+      productId: kopi.id,
+      quantity: 2,
+      price: unitPrice,
+      clientUuid: 'cost-price-1',
+    }),
+  });
+  assert.equal(oldSale.status, 201, `the sale is written locally: ${JSON.stringify(oldSale.body)}`);
+
+  // The owner fills the cost in on the cloud, as they would after importing a
+  // catalog by name and price only.
+  const setCost = await api.cloud.put(`/api/products/${kopi.id}`, {
+    token: world.seeded.token,
+    body: { cost_price: 9000 },
+  });
+  assert.equal(setCost.status, 200, `cost update failed: ${JSON.stringify(setCost.body)}`);
+
+  // Then the replication again — what Settings › Diagnostik › "Salin dari cloud" runs.
+  const boot = await api.edge.post('/api/edge/bootstrap', {
+    token: world.edge.adminToken,
+    body: { branch_id: branchId },
+  });
+  assert.ok(boot.status < 300, `re-bootstrap failed: ${JSON.stringify(boot.body)}`);
+
+  const replica = openReplica(world.servers.edge.dataDir);
+  try {
+    const row = replica.prepare('SELECT cost_price, default_price FROM products WHERE id = ?').get(kopi.id);
+    assert.equal(row.default_price, unitPrice, 'the selling price still replicates');
+    assert.equal(row.cost_price, 9000, 'cost price must replicate: COGS, profit and stock value read this column');
+
+    // The line already written is repaired too, or the report keeps yesterday's
+    // 100 % margin forever.
+    const line = replica
+      .prepare(
+        `SELECT i.cost_price FROM transaction_items i
+           JOIN transactions t ON t.id = i.transaction_id
+          WHERE t.client_uuid = ?`
+      )
+      .get('cost-price-1');
+    assert.equal(line.cost_price, 9000, 'a past line with no cost is filled in from the catalog');
+  } finally {
+    replica.close();
+  }
+  assert.equal(boot.body.costs_fixed, 1, 'the repair is counted, so the shop can explain the change');
+
+  // A sale rung up after the pull stamps the cost itself.
+  const newSale = await api.edge.post('/api/transactions', {
+    token: world.edge.edgeToken,
+    body: saleBody({
+      branchId,
+      productId: kopi.id,
+      quantity: 1,
+      price: unitPrice,
+      clientUuid: 'cost-price-2',
+    }),
+  });
+  assert.equal(newSale.status, 201, `later sale failed: ${JSON.stringify(newSale.body)}`);
+
+  // Both sales sync, so the same two transactions exist on both sides and the
+  // reports become comparable.
+  const drain = await api.edge.post('/api/edge/drain', { token: world.edge.edgeToken, body: { branch_id: branchId } });
+  assert.equal(drain.body.applied, 2, 'both sales reach the cloud');
+
+  const edgeReport = await api.edge.get(`/api/reports/profit?branch_id=${branchId}`, { token: world.edge.adminToken });
+  const cloudReport = await api.cloud.get(`/api/reports/profit?branch_id=${branchId}`, { token: world.seeded.token });
+  assert.equal(edgeReport.status, 200, `till report failed: ${JSON.stringify(edgeReport.body)}`);
+  assert.equal(cloudReport.status, 200, `cloud report failed: ${JSON.stringify(cloudReport.body)}`);
+  assert.equal(edgeReport.body.cogs, 27000, '3 cups at 9.000 is the cost of goods on the till');
+  assert.equal(edgeReport.body.cogs, cloudReport.body.cogs, 'the two sides agree on COGS');
+  assert.equal(edgeReport.body.gross_profit, cloudReport.body.gross_profit, 'and on gross profit');
+  assert.equal(edgeReport.body.margin_percent, cloudReport.body.margin_percent, 'and on the margin');
+});
+
+
 

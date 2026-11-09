@@ -571,9 +571,17 @@ router.get('/sync/bootstrap', authRequired, wrap((req, res) => {
   if (!assertBranchAccess(req, res, branch_id)) return;
   const company = db.prepare('SELECT * FROM companies WHERE id = ?').get(req.user.company_id) || {};
   const branch = db.prepare('SELECT * FROM branches WHERE id = ?').get(branch_id) || {};
+  // `cost_price` travels with the catalog because a till is a report writer too:
+  // its profit, COGS and stock-value reports are computed from this column, so a
+  // snapshot without it left the edge reporting a 100 % margin (COGS 0) while the
+  // cloud reported the real one. Deliberately not permission-filtered the way
+  // `GET /products` is (`stripCost`): the replica is a full clone that the till's
+  // own role checks read from, so withholding the column here would not hide it
+  // from anybody — it would only leave every edge report permanently wrong.
   const products = db
     .prepare(
       `SELECT p.id, p.name, p.sku, p.barcode, p.category_id, p.unit, p.image_url,
+              p.cost_price,
               COALESCE(bp.price_override, p.default_price) AS price,
               COALESCE(bs.quantity, 0) AS stock, COALESCE(bs.low_stock_threshold, 5) AS low_stock_threshold
        FROM products p
