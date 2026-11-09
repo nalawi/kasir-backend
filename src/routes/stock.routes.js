@@ -7,14 +7,40 @@ const router = express.Router();
 
 /* ------------------------------- STOCK -------------------------------- */
 
+// Stock lines for one branch.
+//
+// Driven from `products`, not from `branch_stocks`. A stock row is created
+// lazily — by the first sale, the first adjust or the first opname — so a
+// product that has just been created has no row yet. An INNER JOIN from
+// `branch_stocks` therefore hid every new product from the stock page, and from
+// the opname sheet, which is exactly where you go to give it an opening
+// quantity. A missing row means "zero on hand", which is also what
+// `stockShortfalls()` assumes at checkout, so the two now agree.
+//
+// A deleted product must disappear from this list. The first version of the
+// LEFT JOIN fix kept a line whenever `bs.id IS NOT NULL`, meaning "this product
+// has a stock row" — but a row is created by the first sale, adjust or opname and
+// then survives the delete, so a product that had ever been touched stayed on the
+// stock page after being deleted. The row's quantity is what matters, not its
+// existence: `COALESCE(bs.quantity, 0) <> 0` keeps a deleted product only while it
+// still holds stock (so the quantity is not stranded off-screen) and drops it once
+// the count is zero. `<> 0` rather than `> 0` because negative stock is a real
+// state here — `allow_negative_stock` can leave a line below zero, and hiding it
+// would make the shortfall impossible to find and correct.
 router.get('/branches/:branchId/stock', authRequired, wrap((req, res) => {
   if (!assertBranchAccess(req, res, req.params.branchId)) return;
   const rows = db
     .prepare(
-      `SELECT bs.*, p.name AS product_name, p.sku, p.unit, p.default_price,
-              CASE WHEN bs.quantity <= bs.low_stock_threshold THEN 1 ELSE 0 END AS is_low
-       FROM branch_stocks bs JOIN products p ON p.id = bs.product_id
-       WHERE bs.branch_id = ? AND p.company_id = ? ORDER BY p.name`
+      `SELECT bs.id, bs.branch_id, p.id AS product_id, p.name AS product_name,
+              p.sku, p.unit, p.default_price, bs.updated_at,
+              COALESCE(bs.quantity, 0) AS quantity,
+              COALESCE(bs.low_stock_threshold, 5) AS low_stock_threshold,
+              CASE WHEN COALESCE(bs.quantity, 0) <= COALESCE(bs.low_stock_threshold, 5)
+                   THEN 1 ELSE 0 END AS is_low
+       FROM products p
+       LEFT JOIN branch_stocks bs ON bs.product_id = p.id AND bs.branch_id = ?
+       WHERE p.company_id = ? AND (p.is_active = 1 OR COALESCE(bs.quantity, 0) <> 0)
+       ORDER BY p.name`
     )
     .all(req.params.branchId, req.user.company_id);
   res.json(rows);

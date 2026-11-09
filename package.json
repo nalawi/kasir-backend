@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "test": "node --test --test-concurrency=1 test/edge-sync.test.mjs test/edge-assets.test.mjs test/edge-cors.test.mjs test/stock-policy.test.mjs test/settings.test.mjs test/daily-brief.test.mjs test/transaction-timestamps.test.mjs test/product-import.test.mjs test/product-import-routes.test.mjs test/backup-restore.test.mjs test/register-once.test.mjs test/web-root.test.mjs test/cli.test.mjs",
+    "test": "node --test --test-concurrency=1 test/edge-sync.test.mjs test/edge-assets.test.mjs test/edge-cors.test.mjs test/stock-policy.test.mjs test/stock-list.test.mjs test/settings.test.mjs test/daily-brief.test.mjs test/transaction-timestamps.test.mjs test/product-import.test.mjs test/product-import-routes.test.mjs test/backup-restore.test.mjs test/register-once.test.mjs test/web-root.test.mjs test/cli.test.mjs",
     "parity:golden": "node test/parity/golden-sale.mjs",
     "parity:l5": "node test/parity/edge-l5.mjs",
     "parity:l6": "node test/parity/edge-l6.mjs",
